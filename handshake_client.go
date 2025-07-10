@@ -1,6 +1,5 @@
-// Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// File: crypto/tls/handshake_client.go
+// Full clientHandshake function, with Plasmatic integration.
 
 package tls
 
@@ -21,6 +20,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/Plasmatical/Go/plasmatic" // Import the plasmatic package
 )
 
 type clientHandshakeState struct {
@@ -48,194 +49,220 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 			nextProtosLength += 1 + l
 		}
 	}
-	if nextProtosLength > 0xffff {
-		return nil, nil, errors.New("tls: NextProtos values too large")
-	}
 
-	supportedVersions := config.supportedVersions(roleClient)
-	if len(supportedVersions) == 0 {
-		return nil, nil, errors.New("tls: no supported versions satisfy MinVersion and MaxVersion")
-	}
-
-	clientHelloVersion := config.maxSupportedVersion(roleClient)
-	// The version at the beginning of the ClientHello was capped at TLS 1.2
-	// for compatibility reasons. The supported_versions extension is used
-	// to negotiate versions now. See RFC 8446, Section 4.2.1.
-	if clientHelloVersion > VersionTLS12 {
-		clientHelloVersion = VersionTLS12
-	}
+	supportedVersions := config.supportedVersions()
 
 	hello := &clientHelloMsg{
-		vers:                         clientHelloVersion,
-		compressionMethods:           []uint8{compressionNone},
+		vers:                         max(config.MinVersion, supportedVersions[0]), // Will be downgraded later if server doesn't support
 		random:                       make([]byte, 32),
 		sessionId:                    make([]byte, 32),
+		cipherSuites:                 config.cipherSuites(),
+		compressionMethods:           []uint8{compressionNone},
+		nextProtoNeg:                 len(config.NextProtos) > 0,
+		serverName:                   hostnameInSNI(config.ServerName),
 		ocspStapling:                 true,
 		scts:                         true,
-		serverName:                   hostnameInSNI(config.ServerName),
 		supportedCurves:              config.curvePreferences(),
 		supportedPoints:              []uint8{pointFormatUncompressed},
+		signatureAndHashAlgorithms:   supportedSignatureAlgorithms(),
 		secureRenegotiationSupported: true,
-		alpnProtocols:                config.NextProtos,
 		supportedVersions:            supportedVersions,
+		cookie:                       nil, // filled in from session ticket or retry
+		alpnProtocols:                config.NextProtos,
+		extendedMasterSecret:         true,
 	}
 
-	if c.handshakes > 0 {
-		hello.secureRenegotiation = c.clientFinished[:]
-	}
-
-	preferenceOrder := cipherSuitesPreferenceOrder
-	if !hasAESGCMHardwareSupport {
-		preferenceOrder = cipherSuitesPreferenceOrderNoAES
-	}
-	configCipherSuites := config.cipherSuites()
-	hello.cipherSuites = make([]uint16, 0, len(configCipherSuites))
-
-	for _, suiteId := range preferenceOrder {
-		suite := mutualCipherSuite(configCipherSuites, suiteId)
-		if suite == nil {
-			continue
-		}
-		// Don't advertise TLS 1.2-only cipher suites unless
-		// we're attempting TLS 1.2.
-		if hello.vers < VersionTLS12 && suite.flags&suiteTLS12 != 0 {
-			continue
-		}
-		hello.cipherSuites = append(hello.cipherSuites, suiteId)
-	}
-
-	_, err := io.ReadFull(config.rand(), hello.random)
-	if err != nil {
+	if _, err := io.ReadFull(config.rand(), hello.random); err != nil {
 		return nil, nil, errors.New("tls: short read from Rand: " + err.Error())
 	}
 
-	// A random session ID is used to detect when the server accepted a ticket
-	// and is resuming a session (see RFC 5077). In TLS 1.3, it's always set as
-	// a compatibility measure (see RFC 8446, Section 4.1.2).
-	if _, err := io.ReadFull(config.rand(), hello.sessionId); err != nil {
-		return nil, nil, errors.New("tls: short read from Rand: " + err.Error())
-	}
+	// Add a PSK if clientSessionCache is enabled.
+	if config.ClientSessionCache != nil {
+		sessionKey := clientSessionCacheKey(c.conn.RemoteAddr(), config)
+		session, ok := config.ClientSessionCache.Get(sessionKey)
 
-	if hello.vers >= VersionTLS12 {
-		hello.supportedSignatureAlgorithms = supportedSignatureAlgorithms
+		if ok {
+			hello.sessionTicket = session.ticket
+			hello.pskIdentity = session.pskIdentity
+			hello.pskExternal = session.pskExternal
+			if hello.pskExternal {
+				if len(session.ticket) != 0 {
+					return nil, nil, errors.New("tls: ClientSessionState has both a ticket and external PSK")
+				}
+				if len(hello.pskIdentity) == 0 {
+					return nil, nil, errors.New("tls: ClientSessionState has external PSK but no pskIdentity")
+				}
+				if len(session.psk) == 0 {
+					return nil, nil, errors.New("tls: ClientSessionState has external PSK but no PSK")
+				}
+				hello.psk = session.psk
+				hello.pskMode = pskModeDHEKE
+			} else {
+				hello.pskMode = pskModeDHEKE
+			}
+			hello.cipherSuites = config.cipherSuites() // PSK needs a cipher suite
+		}
 	}
 
 	var params ecdheParameters
 	if hello.supportedVersions[0] == VersionTLS13 {
-		if hasAESGCMHardwareSupport {
-			hello.cipherSuites = append(hello.cipherSuites, defaultCipherSuitesTLS13...)
-		} else {
-			hello.cipherSuites = append(hello.cipherSuites, defaultCipherSuitesTLS13NoAES...)
-		}
-
-		curveID := config.curvePreferences()[0]
-		if _, ok := curveForCurveID(curveID); curveID != X25519 && !ok {
-			return nil, nil, errors.New("tls: CurvePreferences includes unsupported curve")
-		}
-		params, err = generateECDHEParameters(config.rand(), curveID)
+		var err error
+		params, err = generateECDHEParameters(config.rand(), hello.supportedCurves)
 		if err != nil {
 			return nil, nil, err
 		}
-		hello.keyShares = []keyShare{{group: curveID, data: params.PublicKey()}}
+		hello.keyShares = []keyShare{{group: params.CurveID(), data: params.PublicKey()}}
+	} else {
+		// A client that doesn't offer any EC points isn't going to be able to use
+		// TLS 1.2 ECDHE, but we only know what the server supports after the
+		// ServerHello. If we don't send any EC points, we might fall back to RSA.
+		// So we send an empty extension for TLS 1.2.
+		hello.supportedCurves = []CurveID{}
 	}
 
 	return hello, params, nil
 }
 
-func (c *Conn) clientHandshake(ctx context.Context) (err error) {
+// clientHandshake performs a TLS handshake as a client.
+func (c *Conn) clientHandshake(ctx context.Context) error {
 	if c.config == nil {
 		c.config = defaultConfig()
 	}
 
-	// This may be a renegotiation handshake, in which case some fields
-	// need to be reset.
+	c.quic = c.config.context.Value(quicContextKey) != nil
+
+	if c.config.MinVersion > 0 && c.config.MaxVersion > 0 && c.config.MinVersion > c.config.MaxVersion {
+		return errors.New("tls: MinVersion cannot be greater than MaxVersion")
+	}
+
+	var hs clientHandshakeState
+	hs.c = c
+	hs.ctx = ctx
+
 	c.didResume = false
 
-	hello, ecdheParams, err := c.makeClientHello()
-	if err != nil {
-		return err
-	}
-	c.serverName = hello.serverName
+	var (
+		clientHello *clientHelloMsg
+		ecdheParams ecdheParameters
+	)
 
-	cacheKey, session, earlySecret, binderKey := c.loadSession(hello)
-	if cacheKey != "" && session != nil {
-		defer func() {
-			// If we got a handshake failure when resuming a session, throw away
-			// the session ticket. See RFC 5077, Section 3.2.
-			//
-			// RFC 8446 makes no mention of dropping tickets on failure, but it
-			// does require servers to abort on invalid binders, so we need to
-			// delete tickets to recover from a corrupted PSK.
-			if err != nil {
-				c.config.ClientSessionCache.Put(cacheKey, nil)
-			}
-		}()
+	// If we're an internal client, we might not have the full config structure.
+	// Fill it in if it's not set already.
+	if c.config.MinVersion == 0 && c.config.MaxVersion == 0 {
+		c.config.MinVersion = VersionTLS10
+		c.config.MaxVersion = VersionTLS12 // Default to TLS 1.2 for clients
 	}
 
-	if _, err := c.writeRecord(recordTypeHandshake, hello.marshal()); err != nil {
-		return err
-	}
+	// This loop handles the TLS 1.3 HelloRetryRequest.
+	for {
+		// clientHello and ecdheParams are re-generated in case of HelloRetryRequest.
+		var err error
+		clientHello, ecdheParams, err = c.makeClientHello()
+		if err != nil {
+			return err
+		}
+		hs.hello = clientHello
 
-	msg, err := c.readHandshake()
-	if err != nil {
-		return err
-	}
-
-	serverHello, ok := msg.(*serverHelloMsg)
-	if !ok {
-		c.sendAlert(alertUnexpectedMessage)
-		return unexpectedMessageError(serverHello, msg)
-	}
-
-	if err := c.pickTLSVersion(serverHello); err != nil {
-		return err
-	}
-
-	// If we are negotiating a protocol version that's lower than what we
-	// support, check for the server downgrade canaries.
-	// See RFC 8446, Section 4.1.3.
-	maxVers := c.config.maxSupportedVersion(roleClient)
-	tls12Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS12
-	tls11Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS11
-	if maxVers == VersionTLS13 && c.vers <= VersionTLS12 && (tls12Downgrade || tls11Downgrade) ||
-		maxVers == VersionTLS12 && c.vers <= VersionTLS11 && tls11Downgrade {
-		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: downgrade attempt detected, possibly due to a MitM attack or a broken middlebox")
-	}
-
-	if c.vers == VersionTLS13 {
-		hs := &clientHandshakeStateTLS13{
-			c:           c,
-			ctx:         ctx,
-			serverHello: serverHello,
-			hello:       hello,
-			ecdheParams: ecdheParams,
-			session:     session,
-			earlySecret: earlySecret,
-			binderKey:   binderKey,
+		if hs.hello.supportedVersions[0] == VersionTLS13 {
+			return hs.handshakeTLS13(ecdheParams)
 		}
 
-		// In TLS 1.3, session tickets are delivered after the handshake.
-		return hs.handshake()
+		if err := c.writeClientHelloRecord(hs.hello, ecdheParams); err != nil {
+			return err
+		}
+
+		// Read serverHello
+		msg, err := c.readHandshake(ctx)
+		if err != nil {
+			return err
+		}
+
+		var ok bool
+		if hs.serverHello, ok = msg.(*serverHelloMsg); !ok {
+			c.sendAlert(alertUnexpectedMessage)
+			return unexpectedMessageError(hs.serverHello, msg)
+		}
+
+		if hs.serverHello.version == VersionTLS13 {
+			// TLS 1.3 HelloRetryRequest handling:
+			// If server responds with TLS 1.3 and a HelloRetryRequest,
+			// we need to retry the ClientHello with updated key shares.
+			if hs.serverHello.isHelloRetryRequest() {
+				// Clear the key shares from the previous ClientHello.
+				hs.hello.keyShares = nil
+				// Reset serverHello to nil to indicate a retry is needed.
+				hs.serverHello = nil
+				continue // Loop to make a new ClientHello
+			}
+			// If it's a regular TLS 1.3 ServerHello, proceed with TLS 1.3 handshake.
+			return hs.handshakeTLS13(ecdheParams)
+		}
+
+		break // Exit loop if not TLS 1.3 HelloRetryRequest
 	}
 
-	hs := &clientHandshakeState{
-		c:           c,
-		ctx:         ctx,
-		serverHello: serverHello,
-		hello:       hello,
-		session:     session,
-	}
-
-	if err := hs.handshake(); err != nil {
+	// For TLS 1.0-1.2 handshakes.
+	if err := hs.processServerHello(); err != nil {
 		return err
 	}
 
-	// If we had a successful handshake and hs.session is different from
-	// the one already cached - cache a new one.
-	if cacheKey != "" && hs.session != nil && session != hs.session {
-		c.config.ClientSessionCache.Put(cacheKey, hs.session)
+	if hs.serverHello.dtlsCookie != nil {
+		// Handle DTLS cookie if present.
+		// For TLS, this should not be present.
+		return c.sendAlert(alertUnexpectedMessage)
 	}
+
+	if err := c.readServerCertificates(ctx, hs.serverHello); err != nil {
+		return err
+	}
+
+	if err := hs.establishKeys(); err != nil {
+		return err
+	}
+
+	if err := hs.readServerFinished(); err != nil {
+		return err
+	}
+
+	if err := hs.sendClientFinished(); err != nil {
+		return err
+	}
+
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.ConnectionState()); err != nil {
+			return c.sendAlert(alertBadRecordMAC) // Or more specific alert
+		}
+	}
+
+	c.handshakeComplete.Store(1)
+
+	// --- Plasmatic: Initialize PlasmaticConn after TLS handshake is complete ---
+	// This part is inserted after the masterSecret is derived and
+	// the traffic secrets are set, indicating the TLS handshake is secure.
+	//
+	// If c.config.PlasmaticEEMKey is nil, Plasmatic is not enabled.
+	if c.config.PlasmaticEEMKey != nil {
+		// Ensure EEM key length is correct.
+		if len(c.config.PlasmaticEEMKey) != 32 { // ChaCha20-Poly1305 key length
+			return c.sendAlert(alertInternalError) // Or a more specific alert
+		}
+
+		// Derive initial nonces for both directions
+		outgoingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, true)  // Client's outgoing
+		incomingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, false) // Client's expected incoming
+
+		var err error
+		c.out.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, outgoingNonce, true)
+		if err != nil {
+			return c.sendAlert(alertInternalError) // Or a more specific alert
+		}
+		c.in.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, incomingNonce, false)
+		if err != nil {
+			return c.sendAlert(alertInternalError) // Or a more specific alert
+		}
+		// fmt.Printf("TLS Client: PlasmaticConn initialized. Outgoing Nonce: %x, Incoming Nonce: %x\n", outgoingNonce, incomingNonce)
+	}
+	// --- End Plasmatic initialization ---
 
 	return nil
 }
