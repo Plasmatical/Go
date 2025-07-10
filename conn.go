@@ -118,6 +118,8 @@ type Conn struct {
 	// in Conn.Write.
 	activeCall int32
 
+	clientSession *ClientSessionState // <-- 新增此字段
+
 	tmp [16]byte
 }
 
