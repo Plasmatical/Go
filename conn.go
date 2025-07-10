@@ -337,7 +337,7 @@ type cbcMode interface {
 
 // decrypt authenticates and decrypts the record if protection is active at
 // this stage. The returned plaintext might overlap with the input.
-func (hc *halfConn) decrypt(record []byte) ([]len, recordType, error) {
+func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 	var plaintext []byte
 	typ := recordType(record[0])
 	payload := record[recordHeaderLen:]
