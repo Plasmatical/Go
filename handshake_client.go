@@ -66,7 +66,7 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 
 	hello := &clientHelloMsg{
 		vers:                      c.vers,
-		// 修正: 移除不存在的 nextProtoNeg 字段
+		// 修正: 移除不存在的 nextProtoNeg 字段 (假设您的 clientHelloMsg 不支持)
 		cipherSuites:              config.cipherSuites(),
 		compressionMethods:        []uint8{compressionNone},
 		random:                    make([]byte, 32),
@@ -74,9 +74,9 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		scts:                      true,
 		serverName:                hostnameInSNI(config.ServerName),
 		supportedPoints:           []uint8{ellipticPointFormatUncompressed},
-		// 修正: 移除不存在的 signatureAndHashAlgorithms 字段
+		// 修正: 移除不存在的 signatureAndHashAlgorithms 字段 (假设您的 clientHelloMsg 不支持)
 		supportedCurves:           config.supportedCurves(),
-		// 修正: 移除不存在的 extendedMasterSecret 字段
+		// 修正: 移除不存在的 extendedMasterSecret 字段 (假设您的 clientHelloMsg 不支持)
 		sessionTicket:             len(config.SessionTicketsDisabled) == 0,
 		alpnProtocols:             config.NextProtos,
 	}
@@ -85,10 +85,19 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		hello.statusRequest = new(statusRequest)
 	}
 
+	// 新增变量以存储生成的 ECDHE 参数，作为函数返回值的一部分
+	var ecdheParams ecdheParameters
+
 	if hello.supportedCurves != nil {
 		if _, ok := c.config.curvePreferences[CurveP256]; ok {
-			hello.keyShares = append(hello.keyShares, c.make // This line seems incomplete in your original snippet,
-			// assuming it's part of a key exchange, leaving it as is for compilation.
+			var err error
+			// 修正: 生成 ECDHE 参数并附加到 keyShares
+			ecdheParams, err = generateECDHEParameters(c.config, CurveP256)
+			if err != nil {
+				return nil, nil, err // 处理参数生成失败的情况
+			}
+			// 将生成的公钥添加到 keyShares 中
+			hello.keyShares = append(hello.keyShares, keyShare{group: CurveP256, data: ecdheParams.PublicKey()})
 		}
 	}
 
@@ -112,17 +121,18 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		hello.pskIdentities = []pskIdentity{{
 			ticket: session.sessionTicket,
 		}}
-		// 修正: 移除不存在的 pskIdentity 字段
-		// 修正: 移除不存在的 pskExternal 字段
+		// 修正: 移除不存在的 pskIdentity 字段 (假设您的 clientHelloMsg 和 ClientSessionState 不支持)
+		// 修正: 移除不存在的 pskExternal 字段 (假设您的 clientHelloMsg 和 ClientSessionState 不支持)
 	}
 
 	if c.handshakes > 0 && config.Renegotiation == RenegotiateNever {
 		return nil, nil, errors.New("tls: client renegotiation disabled")
 	}
 
-	return hello, nil, nil // placeholder for ecdheParameters, error based on original function signature
+	// 修正: 返回生成的 ecdheParams
+	return hello, ecdheParams, nil
 }
-						 
+
 // clientHandshake performs a TLS handshake as a client.
 func (c *Conn) clientHandshake(ctx context.Context) error {
 	if c.config == nil {
