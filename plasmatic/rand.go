@@ -4,13 +4,6 @@
 
 package plasmatic
 
-import (
-	"crypto/rand"
-	"encoding/binary"
-	"hash/fnv"
-	"time"
-)
-
 type randSource struct {
 	seed int64
 }
