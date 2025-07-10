@@ -24,6 +24,14 @@ import (
 	"github.com/Plasmatical/Go/plasmatic" // Import the plasmatic package
 )
 
+// maxUint16 是一个辅助函数，用于在 Go 1.18 中替代内置的 max 函数。
+func maxUint16(a, b uint16) uint16 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 type clientHandshakeState struct {
 	c            *Conn
 	ctx          context.Context
@@ -33,14 +41,6 @@ type clientHandshakeState struct {
 	finishedHash finishedHash
 	masterSecret []byte
 	session      *ClientSessionState
-}
-
-// maxUint16 是一个辅助函数，用于在 Go 1.18 中替代内置的 max 函数。
-func maxUint16(a, b uint16) uint16 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
