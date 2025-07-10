@@ -748,6 +748,11 @@ type Config struct {
 	// autoSessionTicketKeys is like sessionTicketKeys but is owned by the
 	// auto-rotation logic. See Config.ticketKeys.
 	autoSessionTicketKeys []ticketKey
+
+	// PlasmaticEEMKey is the shared symmetric key used for Plasmatic External Encrypted Mount (EEM) operations.
+	// If nil, Plasmatic functionality is disabled.
+	// This key must be 32 bytes long for ChaCha20-Poly1305.
+	PlasmaticEEMKey []byte
 }
 
 const (
