@@ -180,6 +180,8 @@ type halfConn struct {
 
 	trafficSecret []byte // current TLS 1.3 traffic secret
 
+	conn *Conn // <-- **新增行：添加对父 Conn 实例的引用**
+
 	// Plasmatic specific fields
 	// The Plasmatic connection state for this half (in or out).
 	plasmaticConn *plasmatic.PlasmaticConn //
@@ -503,7 +505,7 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 		// 如果 EEM 中包含 seed 更新指令，则处理
 		if seedUpdate != nil { //
 			// 修复了 'undefined: c' 错误，使用 hc.c 来访问 Conn 对象的 isClient 字段。
-			hc.plasmaticConn.ApplySeedUpdate(seedUpdate, !hc.c.isClient) 
+			hc.plasmaticConn.ApplySeedUpdate(seedUpdate, !hc.conn.isClient)
 		}
 	}
 	// --- Plasmatic: EEM 解密和验证逻辑结束 ---
