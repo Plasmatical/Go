@@ -3,6 +3,8 @@
 
 package plasmatic
 
+import "time"
+
 const (
 	// EEMFixedLength is the fixed total length of the External Encrypted Mount (EEM) in bytes.
 	// This length should be chosen carefully to avoid being a recognizable feature.
