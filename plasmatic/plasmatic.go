@@ -6,8 +6,8 @@ package plasmatic
 
 import (
 	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
+	"time"
 	"errors"
 	"fmt"
 	"io"
