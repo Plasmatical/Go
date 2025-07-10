@@ -1,4 +1,3 @@
-
 // File: github.com/Plasmatical/Go/plasmatic/plasmatic.go
 // This file contains the core logic for the Plasmatic protocol.
 
@@ -13,6 +12,9 @@ import (
 	"io"
 	"bytes"
 	"sync"
+
+	// Import the ChaCha20-Poly1305 implementation
+	"golang.org/x/crypto/chacha20poly1305" 
 )
 
 // PlasmaticConn represents the state for the Plasmatic protocol on one half-connection (send or receive).
@@ -61,7 +63,7 @@ func NewPlasmaticConn(eemKey []byte, initialNonce []byte, isClient bool) (*Plasm
 		eemKey:            eemKey,
 		nextOutgoingNonce: make([]byte, EEMNonceLength),
 		nextExpectedNonce: make([]byte, EEMNonceLength),
-		currentModeID:     0x01, // Default to a common mode, e.g., Web Browsing
+		currentModeID:     0x01, // Default to a common mode, e.g., Web Browse
 		currentSeed:       time.Now().UnixNano(), // Initial seed can be time-based or pre-agreed
 		tpl:               NewDefaultTrafficPatternLibrary(),
 	}
@@ -74,7 +76,8 @@ func NewPlasmaticConn(eemKey []byte, initialNonce []byte, isClient bool) (*Plasm
 // getCipher creates a ChaCha20-Poly1305 AEAD cipher.
 func (pc *PlasmaticConn) getCipher() (cipher.AEAD, error) {
 	// ChaCha20-Poly1305 requires a 32-byte key.
-	aead, err := cipher.NewGCM(cipher.NewCipher(pc.eemKey)) // This is a placeholder, should be ChaCha20Poly1305
+	// Corrected: Use chacha20poly1305.New directly for AEAD.
+	aead, err := chacha20poly1305.New(pc.eemKey)
 	if err != nil {
 		return nil, err
 	}
@@ -296,4 +299,3 @@ func (pc *PlasmaticConn) SetInitialNonce(nonce []byte, isOutgoing bool) error {
 	}
 	return nil
 }
-
