@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/GoTLS/Go/internal/godebug"
+	"github.com/Plasmatical/Go/internal/godebug"
 )
 
 const (
