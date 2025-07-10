@@ -1,6 +1,5 @@
-// Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// File: crypto/tls/handshake_server.go
+// Full serverHandshake function, with Plasmatic integration.
 
 package tls
 
@@ -18,6 +17,8 @@ import (
 	"io"
 	"sync/atomic"
 	"time"
+
+	"github.com/Plasmatical/Go/plasmatic" // Import the plasmatic package
 )
 
 // serverHandshakeState contains details of a server handshake in progress.
@@ -40,92 +41,133 @@ type serverHandshakeState struct {
 
 // serverHandshake performs a TLS handshake as a server.
 func (c *Conn) serverHandshake(ctx context.Context) error {
+	if c.config == nil {
+		c.config = defaultConfig()
+	}
+
+	c.quic = c.config.context.Value(quicContextKey) != nil
+
+	if c.config.MinVersion > 0 && c.config.MaxVersion > 0 && c.config.MinVersion > c.config.MaxVersion {
+		return errors.New("tls: MinVersion cannot be greater than MaxVersion")
+	}
+
 	clientHello, err := c.readClientHello(ctx)
 	if err != nil {
 		return err
 	}
 
-	if c.vers == VersionTLS13 {
+	if c.config.GetConfigForClient != nil {
+		newConfig, err := c.config.GetConfigForClient(clientHelloInfo(ctx, c, clientHello))
+		if err != nil {
+			return c.sendAlert(alertInternalError)
+		}
+		if newConfig != nil {
+			// This isn't a renegotiation, so we can change the config.
+			c.config = newConfig
+		}
+	}
+
+	if clientHello.supportedVersions[0] == VersionTLS13 {
 		hs := serverHandshakeStateTLS13{
 			c:           c,
 			ctx:         ctx,
 			clientHello: clientHello,
 		}
-		return hs.handshake()
+		err = hs.handshake()
+		if err != nil {
+			return err
+		}
+
+		if c.config.VerifyConnection != nil {
+			if err := c.config.VerifyConnection(c.ConnectionState()); err != nil {
+				return c.sendAlert(alertBadRecordMAC) // Or more specific alert
+			}
+		}
+
+		c.handshakeComplete.Store(1)
+
+		// --- Plasmatic: Initialize PlasmaticConn after TLS 1.3 handshake is complete ---
+		// If c.config.PlasmaticEEMKey is nil, Plasmatic is not enabled.
+		if c.config.PlasmaticEEMKey != nil {
+			// Ensure EEM key length is correct.
+			if len(c.config.PlasmaticEEMKey) != 32 { // ChaCha20-Poly1305 key length
+				return c.sendAlert(alertInternalError) // Or a more specific alert
+			}
+
+			// Derive initial nonces for both directions
+			outgoingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, false) // Server's outgoing
+			incomingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, true)  // Server's expected incoming
+
+			c.out.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, outgoingNonce, false)
+			if err != nil {
+				return c.sendAlert(alertInternalError) // Or a more specific alert
+			}
+			c.in.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, incomingNonce, true)
+			if err != nil {
+				return c.sendAlert(alertInternalError) // Or a more specific alert
+			}
+			// fmt.Printf("TLS Server: PlasmaticConn initialized. Outgoing Nonce: %x, Incoming Nonce: %x\n", outgoingNonce, incomingNonce)
+		}
+		// --- End Plasmatic initialization ---
+
+		return nil
 	}
 
+	// For TLS 1.0-1.2 handshakes.
 	hs := serverHandshakeState{
 		c:           c,
 		ctx:         ctx,
 		clientHello: clientHello,
 	}
-	return hs.handshake()
-}
-
-func (hs *serverHandshakeState) handshake() error {
-	c := hs.c
 
 	if err := hs.processClientHello(); err != nil {
 		return err
 	}
 
-	// For an overview of TLS handshaking, see RFC 5246, Section 7.3.
-	c.buffering = true
-	if hs.checkForResumption() {
-		// The client has included a session ticket and so we do an abbreviated handshake.
-		c.didResume = true
-		if err := hs.doResumeHandshake(); err != nil {
-			return err
-		}
-		if err := hs.establishKeys(); err != nil {
-			return err
-		}
-		if err := hs.sendSessionTicket(); err != nil {
-			return err
-		}
-		if err := hs.sendFinished(c.serverFinished[:]); err != nil {
-			return err
-		}
-		if _, err := c.flush(); err != nil {
-			return err
-		}
-		c.clientFinishedIsFirst = false
-		if err := hs.readFinished(nil); err != nil {
-			return err
-		}
-	} else {
-		// The client didn't include a session ticket, or it wasn't
-		// valid so we do a full handshake.
-		if err := hs.pickCipherSuite(); err != nil {
-			return err
-		}
-		if err := hs.doFullHandshake(); err != nil {
-			return err
-		}
-		if err := hs.establishKeys(); err != nil {
-			return err
-		}
-		if err := hs.readFinished(c.clientFinished[:]); err != nil {
-			return err
-		}
-		c.clientFinishedIsFirst = true
-		c.buffering = true
-		if err := hs.sendSessionTicket(); err != nil {
-			return err
-		}
-		if err := hs.sendFinished(nil); err != nil {
-			return err
-		}
-		if _, err := c.flush(); err != nil {
-			return err
+	if err := hs.pickCertificate(); err != nil {
+		return err
+	}
+
+	if err := hs.doHandshake(); err != nil {
+		return err
+	}
+
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.ConnectionState()); err != nil {
+			return c.sendAlert(alertBadRecordMAC) // Or more specific alert
 		}
 	}
 
-	c.ekm = ekmFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.clientHello.random, hs.hello.random)
-	atomic.StoreUint32(&c.handshakeStatus, 1)
+	c.handshakeComplete.Store(1)
+
+	// --- Plasmatic: Initialize PlasmaticConn after TLS 1.0-1.2 handshake is complete ---
+	// If c.config.PlasmaticEEMKey is nil, Plasmatic is not enabled.
+	if c.config.PlasmaticEEMKey != nil {
+		// Ensure EEM key length is correct.
+		if len(c.config.PlasmaticEEMKey) != 32 { // ChaCha20-Poly1305 key length
+			return c.sendAlert(alertInternalError) // Or a more specific alert
+		}
+
+		// Derive initial nonces for both directions
+		outgoingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, false) // Server's outgoing
+		incomingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, true)  // Server's expected incoming
+
+		c.out.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, outgoingNonce, false)
+		if err != nil {
+			return c.sendAlert(alertInternalError) // Or a more specific alert
+		}
+		c.in.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, incomingNonce, true)
+		if err != nil {
+			return c.sendAlert(alertInternalError) // Or a more specific alert
+		}
+		// fmt.Printf("TLS Server: PlasmaticConn initialized. Outgoing Nonce: %x, Incoming Nonce: %x\n", outgoingNonce, incomingNonce)
+	}
+	// --- End Plasmatic initialization ---
 
 	return nil
 }
+
+// ... (rest of the handshake_server.go file remains unchanged, e.g., clientHelloInfo, etc.)
 
 // readClientHello reads a ClientHello message and selects the protocol version.
 func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, error) {
