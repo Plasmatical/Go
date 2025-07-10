@@ -7,7 +7,6 @@ package plasmatic
 import (
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/binary"
 )
 
 // DeriveInitialNonce deterministically derives an initial Nonce from the EEM Key.
