@@ -335,42 +335,17 @@ type cbcMode interface {
 	SetIV([]byte)
 }
 
-// File: crypto/tls/conn.go
 // decrypt authenticates and decrypts the record if protection is active at
 // this stage. The returned plaintext might overlap with the input.
-func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
+func (hc *halfConn) decrypt(record []byte) ([]len, recordType, error) {
 	var plaintext []byte
 	typ := recordType(record[0])
-	// Initial payload slice contains the entire content after the record header,
-	// including TLS encrypted data and potentially the Plasmatic EEM.
-	initialPayload := record[recordHeaderLen:] 
-
-	var tlsEncryptedPayload []byte    // The portion TLS cipher operates on
-	var plasmaticEncryptedEEM []byte // The Plasmatic EEM portion
-
-	// --- Plasmatic: EEM separation logic starts ---
-	if hc.plasmaticConn != nil { 
-		// The record should be long enough to contain at least the TLS header + EEM
-		if len(record) < recordHeaderLen+plasmatic.PlasmaticEEMEncryptedLength {
-			return nil, 0, hc.setErrorLocked(alertBadRecordMAC) // Not enough space for EEM
-		}
-		// The EEM is at the end of the record, after the TLS encrypted payload.
-		eemStartIdx := len(record) - plasmatic.PlasmaticEEMEncryptedLength
-		tlsEncryptedPayload = record[recordHeaderLen:eemStartIdx]
-		plasmaticEncryptedEEM = record[eemStartIdx:]
-	} else {
-		// If no Plasmatic, the entire payload is for TLS.
-		tlsEncryptedPayload = initialPayload
-		plasmaticEncryptedEEM = nil // No EEM to process
-	}
-	// --- Plasmatic: EEM separation logic ends ---
+	payload := record[recordHeaderLen:]
 
 	// In TLS 1.3, change_cipher_spec messages are to be ignored without being
 	// decrypted. See RFC 8446, Appendix D.4.
-	// For CCS, we return the original `initialPayload` as it's not encrypted and doesn't contain app data.
-	// Assuming CCS records do not carry EEM.
 	if hc.version == VersionTLS13 && typ == recordTypeChangeCipherSpec {
-		return initialPayload, typ, nil 
+		return payload, typ, nil
 	}
 
 	paddingGood := byte(255)
@@ -378,73 +353,71 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 
 	explicitNonceLen := hc.explicitNonceLen()
 
-	var tlsDecryptedPayloadWithMACAndPadding []byte // Holds decrypted TLS content, potentially including MAC/padding
-
 	if hc.cipher != nil {
 		switch c := hc.cipher.(type) {
 		case cipher.Stream:
-			// Stream ciphers decrypt in place
-			c.XORKeyStream(tlsEncryptedPayload, tlsEncryptedPayload)
-			tlsDecryptedPayloadWithMACAndPadding = tlsEncryptedPayload
+			c.XORKeyStream(payload, payload)
 		case aead:
-			if len(tlsEncryptedPayload) < explicitNonceLen {
+			if len(payload) < explicitNonceLen {
 				return nil, 0, alertBadRecordMAC
 			}
-			nonce := tlsEncryptedPayload[:explicitNonceLen]
+			nonce := payload[:explicitNonceLen]
 			if len(nonce) == 0 {
 				nonce = hc.seq[:]
 			}
-			// The actual data to open (ciphertext + tag)
-			payloadToOpen := tlsEncryptedPayload[explicitNonceLen:]
+			payload = payload[explicitNonceLen:]
 
 			var additionalData []byte
 			if hc.version == VersionTLS13 {
-				additionalData = record[:recordHeaderLen] // Still uses original record header for AD
+				additionalData = record[:recordHeaderLen]
 			} else {
 				additionalData = append(hc.scratchBuf[:0], hc.seq[:]...)
-				additionalData = append(additionalData, record[:3]...) // type and version from original record
-				n := len(payloadToOpen) - c.Overhead()
+				additionalData = append(additionalData, record[:3]...)
+				n := len(payload) - c.Overhead()
 				additionalData = append(additionalData, byte(n>>8), byte(n))
 			}
 
 			var err error
-			// Decrypt into a new slice or reuse existing. `tlsEncryptedPayload[:0]` is fine.
-			tlsDecryptedPayloadWithMACAndPadding, err = c.Open(tlsEncryptedPayload[:0], nonce, payloadToOpen, additionalData)
+			plaintext, err = c.Open(payload[:0], nonce, payload, additionalData)
 			if err != nil {
 				return nil, 0, alertBadRecordMAC
 			}
 		case cbcMode:
 			blockSize := c.BlockSize()
 			minPayload := explicitNonceLen + roundUp(hc.mac.Size()+1, blockSize)
-			if len(tlsEncryptedPayload)%blockSize != 0 || len(tlsEncryptedPayload) < minPayload {
+			if len(payload)%blockSize != 0 || len(payload) < minPayload {
 				return nil, 0, alertBadRecordMAC
 			}
 
 			if explicitNonceLen > 0 {
-				c.SetIV(tlsEncryptedPayload[:explicitNonceLen])
-				tlsEncryptedPayload = tlsEncryptedPayload[explicitNonceLen:]
+				c.SetIV(payload[:explicitNonceLen])
+				payload = payload[explicitNonceLen:]
 			}
-			c.CryptBlocks(tlsEncryptedPayload, tlsEncryptedPayload)
+			c.CryptBlocks(payload, payload)
 
-			paddingLen, paddingGood = extractPadding(tlsEncryptedPayload)
-			tlsDecryptedPayloadWithMACAndPadding = tlsEncryptedPayload // tlsEncryptedPayload now holds decrypted data, including MAC+padding
+			// In a limited attempt to protect against CBC padding oracles like
+			// Lucky13, the data past paddingLen (which is secret) is passed to
+			// the MAC function as extra data, to be fed into the HMAC after
+			// computing the digest. This makes the MAC roughly constant time as
+			// long as the digest computation is constant time and does not
+			// affect the subsequent write, modulo cache effects.
+			paddingLen, paddingGood = extractPadding(payload)
 		default:
 			panic("unknown cipher type")
 		}
 
 		if hc.version == VersionTLS13 {
-			// TLS 1.3 padding and content type removal applies to `tlsDecryptedPayloadWithMACAndPadding`
 			if typ != recordTypeApplicationData {
 				return nil, 0, alertUnexpectedMessage
 			}
-			if len(tlsDecryptedPayloadWithMACAndPadding) > maxPlaintext+1 {
+			if len(plaintext) > maxPlaintext+1 {
 				return nil, 0, alertRecordOverflow
 			}
 			// Remove padding and find the ContentType scanning from the end.
-			for i := len(tlsDecryptedPayloadWithMACAndPadding) - 1; i >= 0; i-- {
-				if tlsDecryptedPayloadWithMACAndPadding[i] != 0 {
-					typ = recordType(tlsDecryptedPayloadWithMACAndPadding[i])
-					plaintext = tlsDecryptedPayloadWithMACAndPadding[:i]
+			for i := len(plaintext) - 1; i >= 0; i-- {
+				if plaintext[i] != 0 {
+					typ = recordType(plaintext[i])
+					plaintext = plaintext[:i]
 					break
 				}
 				if i == 0 {
@@ -453,69 +426,87 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 			}
 		}
 	} else {
-		tlsDecryptedPayloadWithMACAndPadding = tlsEncryptedPayload // No cipher, so plaintext is just the unencrypted payload
-		plaintext = tlsDecryptedPayloadWithMACAndPadding           // If no cipher, no MAC to remove either, so plaintext is this.
+		plaintext = payload
 	}
 
 	if hc.mac != nil {
 		macSize := hc.mac.Size()
-		if len(tlsDecryptedPayloadWithMACAndMACAndPadding) < macSize { // Check if enough space for MAC
+		if len(payload) < macSize {
 			return nil, 0, alertBadRecordMAC
 		}
 
-		n := len(tlsDecryptedPayloadWithMACAndPadding) - macSize - paddingLen
+		n := len(payload) - macSize - paddingLen
 		n = subtle.ConstantTimeSelect(int(uint32(n)>>31), 0, n) // if n < 0 { n = 0 }
-
-		// Construct a temporary record header for MAC calculation.
-		// The length field in the header must reflect the length of the *decrypted plaintext*.
-		macRecordHeader := make([]byte, recordHeaderLen)
-		copy(macRecordHeader, record[:recordHeaderLen]) // Copy type, version, sequence number
-		macRecordHeader[3] = byte(n >> 8)               // Update length field
-		macRecordHeader[4] = byte(n)
-
-		remoteMAC := tlsDecryptedPayloadWithMACAndPadding[n : n+macSize]
-		localMAC := tls10MAC(hc.mac, hc.scratchBuf[:0], hc.seq[:], macRecordHeader, tlsDecryptedPayloadWithMACAndPadding[:n], tlsDecryptedPayloadWithMACAndPadding[n+macSize:])
+		record[3] = byte(n >> 8)
+		record[4] = byte(n)
+		remoteMAC := payload[n : n+macSize]
+		localMAC := tls10MAC(hc.mac, hc.scratchBuf[:0], hc.seq[:], record[:recordHeaderLen], payload[:n], payload[n+macSize:])
 
 		// This is equivalent to checking the MACs and paddingGood
 		// separately, but in constant-time to prevent distinguishing
-		// padding failures from MAC failures.
+		// padding failures from MAC failures. Depending on what value
+		// of paddingLen was returned on bad padding, distinguishing
+		// bad MAC from bad padding can lead to an attack.
+		//
+		// See also the logic at the end of extractPadding.
 		macAndPaddingGood := subtle.ConstantTimeCompare(localMAC, remoteMAC) & int(paddingGood)
 		if macAndPaddingGood != 1 {
 			return nil, 0, alertBadRecordMAC
 		}
 
-		plaintext = tlsDecryptedPayloadWithMACAndPadding[:n] // Final TLS plaintext after MAC removal
+		plaintext = payload[:n]
 	}
 
 	hc.incSeq()
 
-	// --- Plasmatic: EEM Decryption and Validation ---
-	if hc.plasmaticConn != nil {
-		// plasmaticEncryptedEEM was already extracted at the beginning.
-		// The `plaintext` variable now holds the *decrypted TLS application data*.
-		// Its first 2 bytes are `payloadHeaderFragment` for EEM validation.
+	// --- Plasmatic: EEM 解密和验证逻辑开始 ---
+	if hc.plasmaticConn != nil { //
+		// EEM 位于 TLS Record Payload 之后，其长度是固定的。
+		// record 包含了 record header + encrypted TLS payload + EEM
+		// plaintext 包含了 decrypted TLS payload
 
-		var payloadHeaderFragment []byte
-		if len(plaintext) >= plasmatic.EEMPayloadHeaderFragmentLength {
-			payloadHeaderFragment = plaintext[:plasmatic.EEMPayloadHeaderFragmentLength]
-		} else {
-			// If TLS plaintext is too short for the fragment, handle as an error or pad with zeros.
-			// Creating a padded slice for safety here.
-			payloadHeaderFragment = make([]byte, plasmatic.EEMPayloadHeaderFragmentLength)
-			copy(payloadHeaderFragment, plaintext)
+		// 确保 record 足够长以包含 EEM
+		// 注意: plasmatic.EEMFixedLength 这里应是加密后的 EEM 长度，可能需要根据实际 AEAD overhead 调整。
+		// 如果 plasmatic.EEMFixedLength 指的是AEAD加密前的明文长度，那么这里还需要加上 AEAD 的 Overhead。
+		// 此处保留原始代码，仅修复报错行。
+		if len(record) < recordHeaderLen+len(payload)+plasmatic.EEMFixedLength { //
+			// 如果长度不够，则认为 EEM 不存在或被截断，模拟 TLS 错误
+			return nil, 0, hc.setErrorLocked(alertBadRecordMAC) //
 		}
 
-		seedUpdate, err := hc.plasmaticConn.DecodeEEM(plasmaticEncryptedEEM, payloadHeaderFragment)
-		if err != nil {
-			return nil, 0, hc.setErrorLocked(alertBadRecordMAC) // EEM validation failed
+		// EEM 的起始位置在 record header + original payload 的长度之后
+		eemStart := recordHeaderLen + len(payload) //
+		// EEM 的结束位置是 eemStart + EEMFixedLength
+		eemEnd := eemStart + plasmatic.EEMFixedLength //
+		if eemEnd > len(record) { // Should not happen if previous length check is correct but for safety
+			return nil, 0, hc.setErrorLocked(alertBadRecordMAC) //
 		}
 
-		if seedUpdate != nil {
-			// Fixed: Access c from hc.c
+		encryptedEEM := record[eemStart:eemEnd] //
+
+		// 获取解密后的 TLS payload 的前 2 字节，用于 EEM 内部校验
+		var payloadHeaderFragment []byte //
+		if len(plaintext) >= plasmatic.EEMPayloadHeaderFragmentLength { //
+			payloadHeaderFragment = plaintext[:plasmatic.EEMPayloadHeaderFragmentLength] //
+		} else { // 如果 plaintext 不够 2 字节，这本身就是异常，但也要避免崩溃
+			payloadHeaderFragment = make([]byte, plasmatic.EEMPayloadHeaderFragmentLength) //
+			copy(payloadHeaderFragment, plaintext) //
+		}
+
+		// 解密并验证 EEM
+		seedUpdate, err := hc.plasmaticConn.DecodeEEM(encryptedEEM, payloadHeaderFragment) //
+		if err != nil { //
+			// EEM 验证失败 (解密失败、Nonce 不正确、头部片段不匹配等)
+			return nil, 0, hc.setErrorLocked(alertBadRecordMAC) // 模拟 MAC 错误
+		}
+
+		// 如果 EEM 中包含 seed 更新指令，则处理
+		if seedUpdate != nil { //
+			// 修复了 'undefined: c' 错误，使用 hc.c 来访问 Conn 对象的 isClient 字段。
 			hc.plasmaticConn.ApplySeedUpdate(seedUpdate, !hc.c.isClient) 
 		}
 	}
-	// --- End Plasmatic EEM ---
+	// --- Plasmatic: EEM 解密和验证逻辑结束 ---
 
 	return plaintext, typ, nil
 }
