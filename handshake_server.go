@@ -1,3 +1,7 @@
+// Copyright 2009 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package tls
 
 import (
@@ -12,7 +16,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"sync/atomic"
+	"sync/atomic" // 确保导入并使用
 	"time"
 
 	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
@@ -54,9 +58,9 @@ func (c *Conn) serverHandshake(ctx context.Context) error {
 		err := hs.handshake()
 		if err == nil {
 			// TLS 1.3 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
-			// 如果 hs.masterSecret 在握手完成后仍然为 nil，表示 TLS 1.3 握手逻辑有问题。
+			// hs.masterSecret 应该由 serverHandshakeStateTLS13.handshake() 内部的 sendServerFinished() 填充。
 			if hs.masterSecret == nil {
-				return errors.New("tls: TLS 1.3 handshake completed but masterSecret is nil. Please ensure serverHandshakeStateTLS13.handshake() populates hs.masterSecret.")
+				return errors.New("tls: TLS 1.3 handshake completed but masterSecret is nil. This indicates an issue in handshake_server_tls13.go's logic.")
 			}
 			plasmatic.TLSSharedKey = hs.masterSecret
 		}
@@ -76,9 +80,9 @@ func (c *Conn) serverHandshake(ctx context.Context) error {
 	}
 
 	// TLS 1.0-1.2 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
-	// hs.masterSecret 应该由 hs.handshake() 内部的 establishKeys() 填充。
+	// hs.masterSecret 应该由 hs.handshake() 内部的 establishKeys() 或 doResumeHandshake() 填充。
 	if hs.masterSecret == nil {
-		return errors.New("tls: TLS 1.0-1.2 handshake completed but masterSecret is nil. Please ensure hs.handshake() populates hs.masterSecret.")
+		return errors.New("tls: TLS 1.0-1.2 handshake completed but masterSecret is nil. This indicates an issue in handshake_server.go's handshake() logic.")
 	}
 	plasmatic.TLSSharedKey = hs.masterSecret // 传递 masterSecret
 
@@ -124,6 +128,71 @@ func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, error) {
 	c.out.version = c.vers
 
 	return clientHello, nil
+}
+
+func (hs *serverHandshakeState) handshake() error {
+	c := hs.c
+
+	if err := hs.processClientHello(); err != nil {
+		return err
+	}
+
+	// For an overview of TLS handshaking, see RFC 5246, Section 7.3.
+	c.buffering = true
+	if hs.checkForResumption() {
+		// The client has included a session ticket and so we do an abbreviated handshake.
+		c.didResume = true
+		if err := hs.doResumeHandshake(); err != nil {
+			return err
+		}
+		if err := hs.establishKeys(); err != nil {
+			return err
+		}
+		if err := hs.sendSessionTicket(); err != nil {
+			return err
+		}
+		if err := hs.sendFinished(c.serverFinished[:]); err != nil {
+			return err
+		}
+		if _, err := c.flush(); err != nil {
+			return err
+		}
+		c.clientFinishedIsFirst = false
+		if err := hs.readFinished(nil); err != nil {
+			return err
+		}
+	} else {
+		// The client didn't include a session ticket, or it wasn't
+		// valid so we do a full handshake.
+		if err := hs.pickCipherSuite(); err != nil {
+			return err
+		}
+		if err := hs.doFullHandshake(); err != nil {
+			return err
+		}
+		if err := hs.establishKeys(); err != nil {
+			return err
+		}
+		if err := hs.readFinished(c.clientFinished[:]); err != nil {
+			return err
+		}
+		c.clientFinishedIsFirst = true
+		c.buffering = true
+		if err := hs.sendSessionTicket(); err != nil {
+			return err
+		}
+		if err := hs.sendFinished(nil); err != nil {
+			return err
+		}
+		if _, err := c.flush(); err != nil {
+			return err
+		}
+	}
+
+	c.ekm = ekmFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.clientHello.random, hs.hello.random)
+	atomic.StoreUint32(&c.handshakeStatus, 1) // 确保这里使用了 sync/atomic
+
+	return nil
 }
 
 func (hs *serverHandshakeState) processClientHello() error {
@@ -826,15 +895,15 @@ func clientHelloInfo(ctx context.Context, c *Conn, clientHello *clientHelloMsg) 
 	}
 
 	return &ClientHelloInfo{
-		CipherSuites:      clientHello.cipherSuites,
-		ServerName:        clientHello.serverName,
-		SupportedCurves:   clientHello.supportedCurves,
-		SupportedPoints:   clientHello.supportedPoints,
-		SignatureSchemes:  clientHello.supportedSignatureAlgorithms,
-		SupportedProtos:   clientHello.alpnProtocols,
+		CipherSuites:     clientHello.cipherSuites,
+		ServerName:       clientHello.serverName,
+		SupportedCurves:  clientHello.supportedCurves,
+		SupportedPoints:  clientHello.supportedPoints,
+		SignatureSchemes: clientHello.supportedSignatureAlgorithms,
+		SupportedProtos:  clientHello.alpnProtocols,
 		SupportedVersions: supportedVersions,
-		Conn:              c.conn,
-		config:            c.config,
-		ctx:               ctx,
+		Conn:             c.conn,
+		config:           c.config,
+		ctx:              ctx,
 	}
 }
