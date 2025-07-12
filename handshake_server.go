@@ -1,6 +1,3 @@
-// File: crypto/tls/handshake_server.go
-// Full serverHandshake function, with Plasmatic integration.
-
 package tls
 
 import (
@@ -18,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Plasmatical/Go/plasmatic" // Import the plasmatic package
+	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
 )
 
 // serverHandshakeState contains details of a server handshake in progress.
@@ -41,133 +38,52 @@ type serverHandshakeState struct {
 
 // serverHandshake performs a TLS handshake as a server.
 func (c *Conn) serverHandshake(ctx context.Context) error {
-	if c.config == nil {
-		c.config = defaultConfig()
-	}
-
-	c.quic = c.config.context.Value(quicContextKey) != nil
-
-	if c.config.MinVersion > 0 && c.config.MaxVersion > 0 && c.config.MinVersion > c.config.MaxVersion {
-		return errors.New("tls: MinVersion cannot be greater than MaxVersion")
-	}
-
 	clientHello, err := c.readClientHello(ctx)
 	if err != nil {
 		return err
 	}
 
-	if c.config.GetConfigForClient != nil {
-		newConfig, err := c.config.GetConfigForClient(clientHelloInfo(ctx, c, clientHello))
-		if err != nil {
-			return c.sendAlert(alertInternalError)
-		}
-		if newConfig != nil {
-			// This isn't a renegotiation, so we can change the config.
-			c.config = newConfig
-		}
-	}
-
-	if clientHello.supportedVersions[0] == VersionTLS13 {
+	if c.vers == VersionTLS13 {
+		// 假设 serverHandshakeStateTLS13 存在于 handshake_server_tls13.go 并处理 TLS 1.3 握手。
+		// 这个握手过程必须负责填充 hs.masterSecret。
 		hs := serverHandshakeStateTLS13{
 			c:           c,
 			ctx:         ctx,
 			clientHello: clientHello,
 		}
-		err = hs.handshake()
-		if err != nil {
-			return err
+		err := hs.handshake()
+		if err == nil {
+			// TLS 1.3 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
+			// 如果 hs.masterSecret 在握手完成后仍然为 nil，表示 TLS 1.3 握手逻辑有问题。
+			if hs.masterSecret == nil {
+				return errors.New("tls: TLS 1.3 handshake completed but masterSecret is nil. Please ensure serverHandshakeStateTLS13.handshake() populates hs.masterSecret.")
+			}
+			plasmatic.TLSSharedKey = hs.masterSecret
 		}
-
-		if c.config.VerifyConnection != nil {
-			if err := c.config.VerifyConnection(c.ConnectionState()); err != nil {
-				return c.sendAlert(alertBadRecordMAC) // Or more specific alert
-			}
-		}
-
-		c.handshakeComplete.Store(1)
-
-		// --- Plasmatic: Initialize PlasmaticConn after TLS 1.3 handshake is complete ---
-		// If c.config.PlasmaticEEMKey is nil, Plasmatic is not enabled.
-		if c.config.PlasmaticEEMKey != nil {
-			// Ensure EEM key length is correct.
-			if len(c.config.PlasmaticEEMKey) != 32 { // ChaCha20-Poly1305 key length
-				return c.sendAlert(alertInternalError) // Or a more specific alert
-			}
-
-			// Derive initial nonces for both directions
-			outgoingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, false) // Server's outgoing
-			incomingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, true)  // Server's expected incoming
-
-			c.out.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, outgoingNonce, false)
-			if err != nil {
-				return c.sendAlert(alertInternalError) // Or a more specific alert
-			}
-			c.in.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, incomingNonce, true)
-			if err != nil {
-				return c.sendAlert(alertInternalError) // Or a more specific alert
-			}
-			// fmt.Printf("TLS Server: PlasmaticConn initialized. Outgoing Nonce: %x, Incoming Nonce: %x\n", outgoingNonce, incomingNonce)
-		}
-		// --- End Plasmatic initialization ---
-
-		return nil
+		return err
 	}
 
-	// For TLS 1.0-1.2 handshakes.
+	// 以下是 TLS 1.0-1.2 握手路径
 	hs := serverHandshakeState{
 		c:           c,
 		ctx:         ctx,
 		clientHello: clientHello,
 	}
-
-	if err := hs.processClientHello(); err != nil {
+	
+	err = hs.handshake() // 调用 TLS 1.0-1.2 的握手逻辑
+	if err != nil {
 		return err
 	}
 
-	if err := hs.pickCertificate(); err != nil {
-		return err
+	// TLS 1.0-1.2 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
+	// hs.masterSecret 应该由 hs.handshake() 内部的 establishKeys() 填充。
+	if hs.masterSecret == nil {
+		return errors.New("tls: TLS 1.0-1.2 handshake completed but masterSecret is nil. Please ensure hs.handshake() populates hs.masterSecret.")
 	}
-
-	if err := hs.doHandshake(); err != nil {
-		return err
-	}
-
-	if c.config.VerifyConnection != nil {
-		if err := c.config.VerifyConnection(c.ConnectionState()); err != nil {
-			return c.sendAlert(alertBadRecordMAC) // Or more specific alert
-		}
-	}
-
-	c.handshakeComplete.Store(1)
-
-	// --- Plasmatic: Initialize PlasmaticConn after TLS 1.0-1.2 handshake is complete ---
-	// If c.config.PlasmaticEEMKey is nil, Plasmatic is not enabled.
-	if c.config.PlasmaticEEMKey != nil {
-		// Ensure EEM key length is correct.
-		if len(c.config.PlasmaticEEMKey) != 32 { // ChaCha20-Poly1305 key length
-			return c.sendAlert(alertInternalError) // Or a more specific alert
-		}
-
-		// Derive initial nonces for both directions
-		outgoingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, false) // Server's outgoing
-		incomingNonce := plasmatic.DeriveInitialNonce(c.config.PlasmaticEEMKey, true)  // Server's expected incoming
-
-		c.out.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, outgoingNonce, false)
-		if err != nil {
-			return c.sendAlert(alertInternalError) // Or a more specific alert
-		}
-		c.in.plasmaticConn, err = plasmatic.NewPlasmaticConn(c.config.PlasmaticEEMKey, incomingNonce, true)
-		if err != nil {
-			return c.sendAlert(alertInternalError) // Or a more specific alert
-		}
-		// fmt.Printf("TLS Server: PlasmaticConn initialized. Outgoing Nonce: %x, Incoming Nonce: %x\n", outgoingNonce, incomingNonce)
-	}
-	// --- End Plasmatic initialization ---
+	plasmatic.TLSSharedKey = hs.masterSecret // 传递 masterSecret
 
 	return nil
 }
-
-// ... (rest of the handshake_server.go file remains unchanged, e.g., clientHelloInfo, etc.)
 
 // readClientHello reads a ClientHello message and selects the protocol version.
 func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, error) {
