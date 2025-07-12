@@ -21,17 +21,17 @@ import (
 	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
 )
 
-// TLS 1.3 secret labels (重新引入这些常量定义以确保自包含和编译)
+// TLS 1.3 secret labels (已重命名以避免与其他文件冲突)
 const (
-	derivedSecretLabel          = "derived"
-	clientHandshakeTrafficLabel = "c hs traffic"
-	serverHandshakeTrafficLabel = "s hs traffic"
-	clientApplicationTrafficLabel = "c ap traffic"
-	serverApplicationTrafficLabel = "s ap traffic"
-	exporterLabel               = "exporter"
-	resumptionLabel             = "resumption"
-	resumptionBinderLabel       = "resumption binder"
-	masterSecretLabel           = "master secret"
+	hs_derivedSecretLabel          = "derived"
+	hs_clientHandshakeTrafficLabel = "c hs traffic"
+	hs_serverHandshakeTrafficLabel = "s hs traffic"
+	hs_clientApplicationTrafficLabel = "c ap traffic"
+	hs_serverApplicationTrafficLabel = "s ap traffic"
+	hs_exporterLabel               = "exporter"
+	hs_resumptionLabel             = "resumption"
+	hs_resumptionBinderLabel       = "resumption binder"
+	hs_masterSecretLabel           = "master secret"
 )
 
 // maxClientPSKIdentities is the number of client PSK identities the server will
@@ -120,7 +120,7 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	// The client's application traffic secret is derived by the client, but the server needs
 	// to know how to derive the expected incoming nonce.
 	// We re-derive it here using the master secret and transcript state after client finished.
-	clientTrafficSecret := hs.suite.deriveSecret(hs.masterSecret, clientApplicationTrafficLabel, hs.transcript) // 标签现在是 string
+	clientTrafficSecret := hs.suite.deriveSecret(hs.masterSecret, []byte(hs_clientApplicationTrafficLabel), hs.transcript) // 标签现在是 []byte
 	clientInitialNonce := plasmatic.DeriveInitialNonce(clientTrafficSecret, true)
 	
 	// ** IMPORTANT: c.PlasmaticClientConn field must be defined in tls.Conn (conn.go) **
@@ -339,10 +339,10 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 			continue
 		}
 
-		psk := hs.suite.expandLabel(sessionState.resumptionSecret, "resumption", // 标签现在是 string
+		psk := hs.suite.expandLabel(sessionState.resumptionSecret, []byte(hs_resumptionLabel), // 标签现在是 []byte
 			nil, hs.suite.hash.Size())
 		hs.earlySecret = hs.suite.extract(psk, nil)
-		binderKey := hs.suite.deriveSecret(hs.earlySecret, resumptionBinderLabel, nil) // 标签现在是 string
+		binderKey := hs.suite.deriveSecret(hs.earlySecret, []byte(hs_resumptionBinderLabel), nil) // 标签现在是 []byte
 		// Clone the transcript in case a HelloRetryRequest was recorded.
 		transcript := cloneHash(hs.transcript, hs.suite.hash)
 		if transcript == nil {
@@ -580,13 +580,13 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 		earlySecret = hs.suite.extract(nil, nil)
 	}
 	handshakeSecret := hs.suite.extract(hs.sharedKey,
-		hs.suite.deriveSecret(earlySecret, derivedSecretLabel, nil)) // 标签现在是 string
+		hs.suite.deriveSecret(earlySecret, []byte(hs_derivedSecretLabel), nil)) // 标签现在是 []byte
 
 	clientSecret := hs.suite.deriveSecret(handshakeSecret,
-		clientHandshakeTrafficLabel, hs.transcript) // 标签现在是 string
+		[]byte(hs_clientHandshakeTrafficLabel), hs.transcript) // 标签现在是 []byte
 	c.in.setTrafficSecret(hs.suite, clientSecret)
 	serverSecret := hs.suite.deriveSecret(handshakeSecret,
-		serverHandshakeTrafficLabel, hs.transcript) // 标签现在是 string
+		[]byte(hs_serverHandshakeTrafficLabel), hs.transcript) // 标签现在是 []byte
 	c.out.setTrafficSecret(hs.suite, serverSecret)
 
 	err := c.config.writeKeyLog(keyLogLabelClientHandshake, hs.clientHello.random, clientSecret)
@@ -707,12 +707,12 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 	// Derive secrets that take context through the server Finished.
 
 	hs.masterSecret = hs.suite.extract(nil, // masterSecret 在这里被填充
-		hs.suite.deriveSecret(hs.handshakeSecret, derivedSecretLabel, nil)) // 标签现在是 string
+		hs.suite.deriveSecret(hs.handshakeSecret, []byte(hs_derivedSecretLabel), nil)) // 标签现在是 []byte
 
 	hs.trafficSecret = hs.suite.deriveSecret(hs.masterSecret,
-		clientApplicationTrafficLabel, hs.transcript) // 标签现在是 string
+		[]byte(hs_clientApplicationTrafficLabel), hs.transcript) // 标签现在是 []byte
 	serverSecret := hs.suite.deriveSecret(hs.masterSecret,
-		serverApplicationTrafficLabel, hs.transcript) // 标签现在是 string
+		[]byte(hs_serverApplicationTrafficLabel), hs.transcript) // 标签现在是 []byte
 	c.out.setTrafficSecret(hs.suite, serverSecret)
 
 	err := c.config.writeKeyLog(keyLogLabelClientTraffic, hs.clientHello.random, hs.trafficSecret)
@@ -768,7 +768,7 @@ func (hs *serverHandshakeStateTLS13) sendSessionTickets() error {
 	}
 
 	resumptionSecret := hs.suite.deriveSecret(hs.masterSecret,
-		resumptionLabel, hs.transcript) // 标签现在是 string
+		[]byte(hs_resumptionLabel), hs.transcript) // 标签现在是 []byte
 
 	m := new(newSessionTicketMsgTLS13)
 
@@ -933,17 +933,17 @@ func (hs *serverHandshakeStateTLS13) establishHandshakeSecrets() error {
 		hs.earlySecret = hs.suite.extract(nil, nil)
 	}
 
-	derivedSecret := hs.suite.deriveSecret(hs.earlySecret, derivedSecretLabel, nil) // 标签现在是 string
+	derivedSecret := hs.suite.deriveSecret(hs.earlySecret, []byte(hs_derivedSecretLabel), nil) // 标签现在是 []byte
 	hs.handshakeSecret = hs.suite.extract(hs.sharedKey, derivedSecret)
 
-	clientHandshakeTrafficSecret := hs.suite.deriveSecret(hs.handshakeSecret, clientHandshakeTrafficLabel, hs.transcript) // 标签现在是 string
-	serverHandshakeTrafficSecret := hs.suite.deriveSecret(hs.handshakeSecret, serverHandshakeTrafficLabel, hs.transcript) // 标签现在是 string
+	clientHandshakeTrafficSecret := hs.suite.deriveSecret(hs.handshakeSecret, []byte(hs_clientHandshakeTrafficLabel), hs.transcript) // 标签现在是 []byte
+	serverHandshakeTrafficSecret := hs.suite.deriveSecret(hs.handshakeSecret, []byte(hs_serverHandshakeTrafficLabel), hs.transcript) // 标签现在是 []byte
 
 	c.in.setTrafficSecret(hs.suite, clientHandshakeTrafficSecret)
 	c.out.setTrafficSecret(hs.suite, serverHandshakeTrafficSecret)
 
-	// Corrected: Ensure masterSecret is derived using a string label
-	hs.masterSecret = hs.suite.deriveSecret(hs.handshakeSecret, masterSecretLabel, hs.transcript) // 标签现在是 string
+	// Corrected: Ensure masterSecret is derived using a []byte label
+	hs.masterSecret = hs.suite.deriveSecret(hs.handshakeSecret, []byte(hs_masterSecretLabel), hs.transcript) // 标签现在是 []byte
 
 	return nil
 }
