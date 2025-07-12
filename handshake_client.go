@@ -115,90 +115,104 @@ func maxUint16(a, b uint16) uint16 {
 	return b
 }
 
-// makeClientHello creates a new ClientHello message for TLS 1.0-1.2.
-// Note: It does not generate TLS 1.3 key shares, as that is handled in handshake_client_tls13.go.
-func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
-	config := c.config
-	if len(config.ServerName) == 0 && !config.InsecureSkipVerify {
-		return nil, nil, errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
+
+func (c *Conn) clientHandshake(ctx context.Context) (err error) {
+	if c.config == nil {
+		c.config = defaultConfig()
 	}
 
-	nextProtosLength := 0
-	for _, proto := range config.NextProtos {
-		if l := len(proto); l == 0 || l > 255 {
-			return nil, nil, errors.New("tls: invalid NextProtos value")
-		} else {
-			nextProtosLength += 1 + l
-		}
+	// This may be a renegotiation handshake, in which case some fields
+	// need to be reset.
+	c.didResume = false
+
+	hello, ecdheParams, err := c.makeClientHello()
+	if err != nil {
+		return err
 	}
+	c.serverName = hello.serverName
 
-	supportedVersions := config.supportedVersions(roleClient) // roleClient 是在 tls 包内部定义的常量
-
-	// clientHelloMsg 结构体定义，应与 common.go 或其他消息文件中一致
-	// 包含 TLS 1.3 字段，但在 makeClientHello 中不填充它们
-	hello := &clientHelloMsg{
-		vers:                      c.vers,
-		random:                    make([]byte, 32),
-		cipherSuites:              config.cipherSuites(),
-		compressionMethods:        []uint8{compressionNone},
-		ocspStapling:              true, // 默认启用
-		scts:                      true, // 默认启用
-		serverName:                hostnameInSNI(config.ServerName),
-		supportedPoints:           []uint8{pointFormatUncompressed},
-		signatureAndHashAlgorithms: defaultSignatureSchemes(),
-		supportedCurves:           config.CurvePreferences(), // Assuming CurvePreferences is a method returning []CurveID
-		extendedMasterSecret:      true,                      // 通常启用
-		sessionTicket:             !config.SessionTicketsDisabled,
-		alpnProtocols:             config.NextProtos,
-		supportedVersions:         supportedVersions, // 填充支持的版本
-		statusRequest:             &statusRequest{},  // 修正为指针类型并初始化
-	}
-
-	// For TLS 1.0-1.2, keyShares will remain nil, as it's handled by TLS 1.3 specific handshake.
-	// ecdheParams will also be nil here.
-
-	// Session Resumption
-	if c.config.ClientSessionCache != nil && c.clientSession == nil {
-		sessionKey := clientSessionCacheKey(c.conn.RemoteAddr(), config)
-		if session, ok := config.ClientSessionCache.Get(sessionKey); ok {
-			if config.VerifyPeerCertificate != nil || !config.InsecureSkipVerify {
-				if err := c.verifyServerCertificate(session.PeerCertificates); err != nil {
-					session = nil
-				}
+	cacheKey, session, earlySecret, binderKey := c.loadSession(hello)
+	if cacheKey != "" && session != nil {
+		defer func() {
+			// If we got a handshake failure when resuming a session, throw away
+			// the session ticket. See RFC 5077, Section 3.2.
+			//
+			// RFC 8446 makes no mention of dropping tickets on failure, but it
+			// does require servers to abort on invalid binders, so we need to
+			// delete tickets to recover from a corrupted PSK.
+			if err != nil {
+				c.config.ClientSessionCache.Put(cacheKey, nil)
 			}
-			if session != nil {
-				c.clientSession = session
-			}
+		}()
+	}
+
+	if _, err := c.writeRecord(recordTypeHandshake, hello.marshal()); err != nil {
+		return err
+	}
+
+	msg, err := c.readHandshake()
+	if err != nil {
+		return err
+	}
+
+	serverHello, ok := msg.(*serverHelloMsg)
+	if !ok {
+		c.sendAlert(alertUnexpectedMessage)
+		return unexpectedMessageError(serverHello, msg)
+	}
+
+	if err := c.pickTLSVersion(serverHello); err != nil {
+		return err
+	}
+
+	// If we are negotiating a protocol version that's lower than what we
+	// support, check for the server downgrade canaries.
+	// See RFC 8446, Section 4.1.3.
+	maxVers := c.config.maxSupportedVersion(roleClient)
+	tls12Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS12
+	tls11Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS11
+	if maxVers == VersionTLS13 && c.vers <= VersionTLS12 && (tls12Downgrade || tls11Downgrade) ||
+		maxVers == VersionTLS12 && c.vers <= VersionTLS11 && tls11Downgrade {
+		c.sendAlert(alertIllegalParameter)
+		return errors.New("tls: downgrade attempt detected, possibly due to a MitM attack or a broken middlebox")
+	}
+
+	if c.vers == VersionTLS13 {
+		hs := &clientHandshakeStateTLS13{
+			c:           c,
+			ctx:         ctx,
+			serverHello: serverHello,
+			hello:       hello,
+			ecdheParams: ecdheParams,
+			session:     session,
+			earlySecret: earlySecret,
+			binderKey:   binderKey,
 		}
+
+		// In TLS 1.3, session tickets are delivered after the handshake.
+		return hs.handshake()
 	}
 
-	if c.clientSession != nil {
-		session := c.clientSession
-		hello.pskIdentities = []pskIdentity{{
-			ticket: session.sessionTicket,
-		}}
-		// pskExternal 等字段由 TLS 1.3 路径处理
+	hs := &clientHandshakeState{
+		c:           c,
+		ctx:         ctx,
+		serverHello: serverHello,
+		hello:       hello,
+		session:     session,
 	}
 
-	if c.handshakes > 0 && config.Renegotiation == RenegotiateNever {
-		return nil, nil, errors.New("tls: client renegotiation disabled")
+	if err := hs.handshake(); err != nil {
+		return err
 	}
 
-	return hello, nil, nil // 对于 TLS 1.0-1.2，ecdheParameters 返回 nil
+	// If we had a successful handshake and hs.session is different from
+	// the one already cached - cache a new one.
+	if cacheKey != "" && hs.session != nil && session != hs.session {
+		c.config.ClientSessionCache.Put(cacheKey, hs.session)
+	}
+
+	return nil
 }
-
-// ... (其余不变的函数，如: verifyServerCertificate, clientHandshakeState.handshake,
-// clientHandshakeState.establishKeys, clientHandshakeState.doClientCertReq,
-// clientHandshakeState.pickCipherSuite, clientHandshakeState.readServerHello, etc.) ...
-
-// 这些辅助函数应该已经存在或需要根据您的原始文件进行调整
-// 例如: readHandshake, c.sendClientHello, c.sendAlert, etc.
-
-// getClientCertificate, clientSessionCacheKey, hostnameInSNI 等辅助函数保持不变。
-
-// NOTE: 您原始的 clientHandshake 函数的其余逻辑 (readServerHello, establishKeys, etc.)
-// 需要被放置回 clientHandshake 函数的相应位置。
-// 我在上面的 clientHandshake 中放置了注释来指导您。
 
 func (c *Conn) loadSession(hello *clientHelloMsg) (cacheKey string,
 	session *ClientSessionState, earlySecret, binderKey []byte) {
