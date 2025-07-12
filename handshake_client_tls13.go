@@ -11,6 +11,7 @@ import (
 	"crypto/hmac"
 	"crypto/rsa"
 	"errors"
+	"fmt" // 确保导入 fmt 包
 	"hash"
 	"sync/atomic"
 	"time"
@@ -51,8 +52,6 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 	}
 
 	// Consistency check on the presence of a keyShare and its parameters.
-	// Original code: if hs.ecdheParams == nil || len(hs.hello.keyShares) != 1 {
-	// Assuming ecdheParams.PublicKey() is the correct check for parameter presence.
 	if hs.ecdheParams == nil || hs.ecdheParams.PublicKey() == nil || len(hs.hello.keyShares) != 1 {
 		c.sendAlert(alertInternalError)
 		return errors.New("tls: internal error: missing ECDHE parameters or invalid key shares")
@@ -113,10 +112,11 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 	}
 	clientEEMKey := hs.trafficSecret
 	clientInitialNonce := plasmatic.DeriveInitialNonce(clientEEMKey, true)
-	// Assuming c.PlasmaticClientConn is a field in tls.Conn
-	c.PlasmaticClientConn, err = plasmatic.NewPlasmaticConn(clientEEMKey, clientInitialNonce, true)
-	if err != nil {
-		return fmt.Errorf("tls: failed to initialize PlasmaticClientConn: %w", err)
+	
+	var plasmaticErr error // 声明 plasmaticErr 变量
+	c.PlasmaticClientConn, plasmaticErr = plasmatic.NewPlasmaticConn(clientEEMKey, clientInitialNonce, true)
+	if plasmaticErr != nil {
+		return fmt.Errorf("tls: failed to initialize PlasmaticClientConn: %w", plasmaticErr)
 	}
 
 	// Also, derive initial nonce for the server's outgoing EEMs (client expects this as incoming)
@@ -125,10 +125,10 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 	// We re-derive it here using the master secret and transcript state after server finished.
 	serverTrafficSecret := hs.suite.deriveSecret(hs.masterSecret, serverApplicationTrafficLabel, hs.transcript)
 	serverInitialNonce := plasmatic.DeriveInitialNonce(serverTrafficSecret, false)
-	// Assuming c.PlasmaticServerConn is a field in tls.Conn
-	c.PlasmaticServerConn, err = plasmatic.NewPlasmaticConn(serverTrafficSecret, serverInitialNonce, false)
-	if err != nil {
-		return fmt.Errorf("tls: failed to initialize PlasmaticServerConn: %w", err)
+	
+	c.PlasmaticServerConn, plasmaticErr = plasmatic.NewPlasmaticConn(serverTrafficSecret, serverInitialNonce, false)
+	if plasmaticErr != nil {
+		return fmt.Errorf("tls: failed to initialize PlasmaticServerConn: %w", plasmaticErr)
 	}
 
 	atomic.StoreUint32(&c.handshakeStatus, 1)
