@@ -1,5 +1,5 @@
 // File: github.com/Plasmatical/Go/plasmatic/common.go
-// This file defines constants for the Plasmatic EEM structure.
+// This file defines constants for the Plasmatic EEM structure and Traffic Pattern Library.
 
 package plasmatic
 
@@ -13,10 +13,17 @@ const (
 	// EEMNonceLength is the length of the Nonce used within the EEM.
 	EEMNonceLength = 12 // Using 12 bytes for nonce, common for AEAD ciphers like ChaCha20-Poly1305.
 	// EEMPayloadHeaderFragmentLength is the length of the TLS encrypted payload header fragment included in EEM.
-	EEMPayloadHeaderFragmentLength = 2 // As per spec, first 2 bytes of encrypted payload.
+	// As per spec, first 2 bytes of encrypted payload.
+	EEMPayloadHeaderFragmentLength = 2
 	// SeedUpdateMaxLength is the maximum allowed length for the encrypted SeedUpdate data within EEM.
 	// EEMFixedLength - EEMNonceLength - EEMPayloadHeaderFragmentLength must be >= SeedUpdateMaxLength.
 	SeedUpdateMaxLength = 40 // Example: Adjust based on actual SeedUpdate struct size.
+
+	// MaxPlaintextPayloadSize represents the maximum size of the TLS plaintext payload
+	// that Plasmatic expects to receive from the underlying TLS layer.
+	// This is typically derived from the TLS record layer's maximum plaintext size.
+	// For TLS 1.3, this is 16384 bytes (RFC 8446, Section 5.1).
+	MaxPlaintextPayloadSize = 16384
 )
 
 // SeedUpdate represents the parameters for dynamically adjusting the traffic mode.
@@ -30,7 +37,6 @@ type SeedUpdate struct {
 	Persist bool
 	// Direction indicates which side's behavior this update applies to (e.g., client's or server's).
 	// This is useful for asymmetric control, though the current spec implies mutual control.
-	// For now, it's implicit in who sends/receives, but could be explicit if needed.
 	// For simplicity, we'll assume it applies to the receiver's behavior.
 }
 
@@ -47,7 +53,7 @@ type TrafficPatternLibrary interface {
 	GetNextSeedUpdate(currentModeID uint8, currentSeed int64) *SeedUpdate
 }
 
-// DefaultTrafficPatternLibrary is a placeholder for a concrete implementation of TrafficPatternLibrary.
+// DefaultTrafficPatternLibrary is a concrete implementation of TrafficPatternLibrary.
 // In a real scenario, this would be much more complex, potentially involving statistical models.
 type DefaultTrafficPatternLibrary struct{}
 
@@ -56,54 +62,156 @@ func NewDefaultTrafficPatternLibrary() *DefaultTrafficPatternLibrary {
 	return &DefaultTrafficPatternLibrary{}
 }
 
-// GetPayloadSizeForMode provides a basic example of how payload size might be determined.
-// In a real implementation, this would involve complex logic based on the mode and seed.
+// GetPayloadSizeForMode provides a basic example of how payload size might be determined
+// for various common internet traffic patterns.
+// In a real implementation, this would involve complex logic based on the mode and seed
+// to generate sizes that closely mimic actual network traffic distributions.
 func (tpl *DefaultTrafficPatternLibrary) GetPayloadSizeForMode(modeID uint8, seed int64) int {
-	// This is a simplified example. A real implementation would use the seed
-	// to derive a pseudo-random size within the constraints of the mode.
-	// For instance, seed could influence a PRNG to pick a size from a distribution.
+	r := newRand(seed) // Use the deterministic pseudo-random number generator
 	switch modeID {
 	case 0x01: // Web Browsing Mode (smaller packets, bursty)
-		// Example: use seed to pick a size between 100 and 1000 bytes
-		// For deterministic pseudo-randomness based on seed:
-		r := newRand(seed)
-		return 100 + r.Intn(901) // Size between 100 and 1000
+		// Mimics typical HTTP/HTTPS traffic: varied sizes for small requests, larger for responses.
+		// Range: 100-1500 bytes
+		return 100 + r.Intn(1401)
 	case 0x02: // Video Streaming Mode (larger packets, continuous)
-		// Example: use seed to pick a size between 1000 and 16000 bytes
-		r := newRand(seed)
-		return 1000 + r.Intn(15001) // Size between 1000 and 16000
-	case 0x03: // Idle Mode (very small packets, infrequent)
-		r := newRand(seed)
-		return 10 + r.Intn(51) // Size between 10 and 60
+		// Mimics continuous data flow for video, often pushing max payload size.
+		// Range: 1000-16000 bytes
+		return 1000 + r.Intn(15001)
+	case 0x03: // Idle Mode (very small packets, infrequent keep-alives)
+		// Mimics minimal background traffic.
+		// Range: 10-60 bytes
+		return 10 + r.Intn(51)
+	case 0x04: // Online Gaming Mode (small, frequent updates, occasional larger state syncs)
+		// Mimics interactive game traffic: many small packets for controls, some larger for game state.
+		// Bias towards smaller packets, with a chance for medium ones.
+		if r.Intn(100) < 70 { // 70% chance for smaller packets
+			return 50 + r.Intn(201) // Range: 50-250 bytes
+		}
+		return 500 + r.Intn(1501) // 30% chance for medium packets, Range: 500-2000 bytes
+	case 0x05: // Voice/Video Call Mode (consistent small/medium packets, low latency)
+		// Mimics real-time communication with relatively consistent packet sizes.
+		// Range: 100-500 bytes
+		return 100 + r.Intn(401)
+	case 0x06: // Large File Download Mode (max payload size, continuous)
+		// Mimics bulk data transfer, aiming for maximum throughput.
+		// Uses the defined MaxPlaintextPayloadSize.
+		return MaxPlaintextPayloadSize
+	case 0x07: // Email Synchronization Mode (variable, often medium-sized bursts, infrequent)
+		// Mimics email client syncs: can be small for headers, larger for content.
+		// Range: 200-2000 bytes
+		return 200 + r.Intn(1801)
+	case 0x08: // DNS Over TLS (DoT) / Small Query Mode (very small, consistent)
+		// Mimics DNS queries/responses over TLS: typically very small and uniform.
+		// Range: 50-150 bytes
+		return 50 + r.Intn(101)
 	default:
 		// Default to a medium size if mode is unknown.
-		r := newRand(seed)
-		return 500 + r.Intn(1001) // Size between 500 and 1500
+		// Range: 500-1500 bytes
+		return 500 + r.Intn(1001)
 	}
 }
 
-// GetInterPacketDelayForMode provides a basic example of inter-packet delay.
+// GetInterPacketDelayForMode provides a basic example of inter-packet delay
+// for various common internet traffic patterns.
 // This would be used by higher-level Plasmatic logic, not directly by TLS core.
 func (tpl *DefaultTrafficPatternLibrary) GetInterPacketDelayForMode(modeID uint8, seed int64) time.Duration {
-	r := newRand(seed)
+	r := newRand(seed) // Use the deterministic pseudo-random number generator
 	switch modeID {
-	case 0x01: // Web Browsing Mode (variable delay)
-		return time.Duration(r.Intn(100)+10) * time.Millisecond // 10-110ms
+	case 0x01: // Web Browsing Mode (variable delay, can be bursty)
+		// Mimics human interaction: pauses between requests, then bursts of data.
+		// Range: 10-110ms
+		return time.Duration(r.Intn(100)+10) * time.Millisecond
 	case 0x02: // Video Streaming Mode (low, consistent delay)
-		return time.Duration(r.Intn(5)+1) * time.Millisecond // 1-5ms
+		// Mimics continuous, low-latency data delivery.
+		// Range: 1-5ms
+		return time.Duration(r.Intn(5)+1) * time.Millisecond
 	case 0x03: // Idle Mode (long delay)
-		return time.Duration(r.Intn(500)+500) * time.Millisecond // 500-1000ms
+		// Mimics very infrequent keep-alive or background checks.
+		// Range: 500-1000ms
+		return time.Duration(r.Intn(500)+500) * time.Millisecond
+	case 0x04: // Online Gaming Mode (very low, bursty delay)
+		// Mimics rapid, interactive input and output.
+		// Range: 5-25ms
+		return time.Duration(r.Intn(20)+5) * time.Millisecond
+	case 0x05: // Voice/Video Call Mode (very low, consistent delay)
+		// Mimics real-time, continuous audio/video frames.
+		// Range: 10-20ms
+		return time.Duration(r.Intn(10)+10) * time.Millisecond
+	case 0x06: // Large File Download Mode (minimal delay, continuous)
+		// Mimics maximizing throughput, sending packets back-to-back.
+		// Range: 1-5ms
+		return time.Duration(r.Intn(5)+1) * time.Millisecond
+	case 0x07: // Email Synchronization Mode (infrequent, longer pauses)
+		// Mimics periodic checks or larger syncs with significant idle periods.
+		// Range: 1000-5000ms (1-5 seconds)
+		return time.Duration(r.Intn(4000)+1000) * time.Millisecond
+	case 0x08: // DNS Over TLS (DoT) / Small Query Mode (variable, quick response, then idle)
+		// Mimics quick query-response cycles followed by longer periods of no activity.
+		// Range: 50-550ms
+		return time.Duration(r.Intn(500)+50) * time.Millisecond
 	default:
-		return time.Duration(r.Intn(50)+50) * time.Millisecond // 50-100ms
+		// Default to a medium delay if mode is unknown.
+		// Range: 50-100ms
+		return time.Duration(r.Intn(50)+50) * time.Millisecond
 	}
 }
 
-// GetNextSeedUpdate is a placeholder. In a real system, this would be driven by
-// external signals (e.g., detected censorship, user preference) and internal heuristics.
-func (tpl *DefaultTrafficPatternLibrary) GetNextSeedUpdate(currentModeID uint8, currentSeed int64) *SeedUpdate {
-	// For demonstration, let's assume a simple state machine or external trigger.
-	// In a real scenario, this would be much more complex.
-	return nil // No update pending by default
+// Define a sequence of modes to cycle through.
+var modeSequence = []uint8{
+	0x01, // Web Browsing
+	0x02, // Video Streaming
+	0x04, // Online Gaming
+	0x05, // Voice/Video Call
+	0x06, // Large File Download
+	0x07, // Email Synchronization
+	0x08, // DNS Over TLS
+	0x03, // Idle
 }
 
+// modeChangeInterval defines how frequently (in terms of seed increments) a mode change should be considered.
+// This is an arbitrary value to simulate a periodic change.
+const modeChangeInterval = 10000 // Change mode every 10,000 "units" of seed progression
 
+// GetNextSeedUpdate determines if a seed update is needed based on current state and mode.
+// This implementation simulates a deterministic, cyclical mode switching strategy
+// based on the progression of the current seed.
+// In a real production system, this would integrate with external signals (e.g.,
+// detected censorship, user preference, network conditions) and more complex
+// heuristics or machine learning models to dynamically select the most
+// appropriate traffic pattern.
+func (tpl *DefaultTrafficPatternLibrary) GetNextSeedUpdate(currentModeID uint8, currentSeed int64) *SeedUpdate {
+	// Check if the current seed progression warrants a mode change.
+	// Using modulo ensures a deterministic trigger point.
+	if currentSeed%modeChangeInterval == 0 && currentSeed != 0 { // Avoid triggering on initial seed 0
+		// Determine the index of the current mode in the sequence.
+		currentIndex := -1
+		for i, mode := range modeSequence {
+			if mode == currentModeID {
+				currentIndex = i
+				break
+			}
+		}
+
+		nextModeID := modeSequence[0] // Default to the first mode if current is not found or at end
+		if currentIndex != -1 {
+			// Calculate the next mode in the sequence.
+			nextIndex := (currentIndex + 1) % len(modeSequence)
+			nextModeID = modeSequence[nextIndex]
+		}
+
+		// Generate a new seed value. For deterministic progression,
+		// we can simply increment the current seed or derive it based on a hash.
+		// For simplicity and to ensure it's always new, we'll increment.
+		newSeedValue := currentSeed + 1 // Ensure new seed is always greater
+
+		// Create the SeedUpdate. Persist is false for automatic cycling.
+		return &SeedUpdate{
+			ModeID:    nextModeID,
+			SeedValue: newSeedValue,
+			Persist:   false, // Automatic transitions are not persistent by default
+		}
+	}
+
+	// No update pending by default if the interval condition is not met.
+	return nil
+}
