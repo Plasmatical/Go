@@ -118,6 +118,11 @@ type Conn struct {
 	// in Conn.Write.
 	activeCall int32
 
+		// PlasmaticClientConn manages the Plasmatic EEM state for outgoing (client-to-server) traffic.
+	PlasmaticClientConn *plasmatic.PlasmaticConn
+	// PlasmaticServerConn manages the Plasmatic EEM state for incoming (server-to-client) traffic.
+	PlasmaticServerConn *plasmatic.PlasmaticConn
+
 	clientSession *ClientSessionState // <-- 新增此字段
 
 	tmp [16]byte

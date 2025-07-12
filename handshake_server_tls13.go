@@ -12,11 +12,26 @@ import (
 	"crypto/rsa"
 	"encoding/binary"
 	"errors"
+	"fmt" // 确保导入 fmt 包
 	"hash"
+	"io"
 	"sync/atomic"
 	"time"
 
 	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
+)
+
+// TLS 1.3 secret labels (已重命名以避免与其他文件冲突)
+const (
+	hs_derivedSecretLabel          = "derived"
+	hs_clientHandshakeTrafficLabel = "c hs traffic"
+	hs_serverHandshakeTrafficLabel = "s hs traffic"
+	hs_clientApplicationTrafficLabel = "c ap traffic"
+	hs_serverApplicationTrafficLabel = "s ap traffic"
+	hs_exporterLabel               = "exporter"
+	hs_resumptionLabel             = "resumption"
+	hs_resumptionBinderLabel       = "resumption binder"
+	hs_masterSecretLabel           = "master secret"
 )
 
 // maxClientPSKIdentities is the number of client PSK identities the server will
@@ -38,7 +53,7 @@ type serverHandshakeStateTLS13 struct {
 	sharedKey       []byte
 	handshakeSecret []byte
 	masterSecret    []byte
-	trafficSecret   []byte // client_application_traffic_secret_0
+	trafficSecret   []byte // server_application_traffic_secret_0
 	transcript      hash.Hash
 	clientFinished  []byte
 }
@@ -66,12 +81,14 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	if err := hs.sendServerFinished(); err != nil { // masterSecret 在这里被填充
 		return err
 	}
+
 	// Note that at this point we could start sending application data without
 	// waiting for the client's second flight, but the application might not
 	// expect the lack of replay protection of the ClientHello parameters.
 	if _, err := c.flush(); err != nil {
 		return err
 	}
+
 	if err := hs.readClientCertificate(); err != nil {
 		return err
 	}
@@ -80,6 +97,39 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	}
 
 	atomic.StoreUint32(&c.handshakeStatus, 1)
+
+	// Plasmatic Integration: Initialize PlasmaticConn
+	// Using server_application_traffic_secret_0 as EEM key for the server's outgoing traffic.
+	// This trafficSecret is derived in sendServerFinished, so it should be available here.
+	if hs.trafficSecret == nil {
+		return errors.New("tls: internal error: server traffic secret is nil after handshake")
+	}
+	serverEEMKey := hs.trafficSecret
+	serverInitialNonce := plasmatic.DeriveInitialNonce(serverEEMKey, false)
+	
+	var plasmaticErr error // 声明 plasmaticErr 变量
+	// ** IMPORTANT: c.PlasmaticServerConn field must be defined in tls.Conn (conn.go) **
+	// If you encounter "undefined (type *Conn has no field or method PlasmaticServerConn)" error,
+	// please add `PlasmaticServerConn *plasmatic.PlasmaticConn` to the tls.Conn struct in conn.go.
+	c.PlasmaticServerConn, plasmaticErr = plasmatic.NewPlasmaticConn(serverEEMKey, serverInitialNonce, false)
+	if plasmaticErr != nil {
+		return fmt.Errorf("tls: failed to initialize PlasmaticServerConn: %w", plasmaticErr)
+	}
+
+	// Also, derive initial nonce for the client's outgoing EEMs (server expects this as incoming)
+	// The client's application traffic secret is derived by the client, but the server needs
+	// to know how to derive the expected incoming nonce.
+	// We re-derive it here using the master secret and transcript state after client finished.
+	clientTrafficSecret := hs.suite.deriveSecret(hs.masterSecret, hs_clientApplicationTrafficLabel, hs.transcript) // 标签现在是 string
+	clientInitialNonce := plasmatic.DeriveInitialNonce(clientTrafficSecret, true)
+	
+	// ** IMPORTANT: c.PlasmaticClientConn field must be defined in tls.Conn (conn.go) **
+	// If you encounter "undefined (type *Conn has no field or method PlasmaticClientConn)" error,
+	// please add `PlasmaticClientConn *plasmatic.PlasmaticConn` to the tls.Conn struct in conn.go.
+	c.PlasmaticClientConn, plasmaticErr = plasmatic.NewPlasmaticConn(clientTrafficSecret, clientInitialNonce, true)
+	if plasmaticErr != nil {
+		return fmt.Errorf("tls: failed to initialize PlasmaticClientConn: %w", plasmaticErr)
+	}
 
 	return nil
 }
@@ -289,10 +339,10 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 			continue
 		}
 
-		psk := hs.suite.expandLabel(sessionState.resumptionSecret, "resumption",
+		psk := hs.suite.expandLabel(sessionState.resumptionSecret, hs_resumptionLabel, // 标签现在是 string
 			nil, hs.suite.hash.Size())
 		hs.earlySecret = hs.suite.extract(psk, nil)
-		binderKey := hs.suite.deriveSecret(hs.earlySecret, resumptionBinderLabel, nil)
+		binderKey := hs.suite.deriveSecret(hs.earlySecret, hs_resumptionBinderLabel, nil) // 标签现在是 string
 		// Clone the transcript in case a HelloRetryRequest was recorded.
 		transcript := cloneHash(hs.transcript, hs.suite.hash)
 		if transcript == nil {
@@ -530,13 +580,13 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 		earlySecret = hs.suite.extract(nil, nil)
 	}
 	handshakeSecret := hs.suite.extract(hs.sharedKey,
-		hs.suite.deriveSecret(earlySecret, "derived", nil))
+		hs.suite.deriveSecret(earlySecret, hs_derivedSecretLabel, nil)) // 标签现在是 string
 
 	clientSecret := hs.suite.deriveSecret(handshakeSecret,
-		clientHandshakeTrafficLabel, hs.transcript)
+		hs_clientHandshakeTrafficLabel, hs.transcript) // 标签现在是 string
 	c.in.setTrafficSecret(hs.suite, clientSecret)
 	serverSecret := hs.suite.deriveSecret(handshakeSecret,
-		serverHandshakeTrafficLabel, hs.transcript)
+		hs_serverHandshakeTrafficLabel, hs.transcript) // 标签现在是 string
 	c.out.setTrafficSecret(hs.suite, serverSecret)
 
 	err := c.config.writeKeyLog(keyLogLabelClientHandshake, hs.clientHello.random, clientSecret)
@@ -657,12 +707,12 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 	// Derive secrets that take context through the server Finished.
 
 	hs.masterSecret = hs.suite.extract(nil, // masterSecret 在这里被填充
-		hs.suite.deriveSecret(hs.handshakeSecret, "derived", nil))
+		hs.suite.deriveSecret(hs.handshakeSecret, hs_derivedSecretLabel, nil)) // 标签现在是 string
 
 	hs.trafficSecret = hs.suite.deriveSecret(hs.masterSecret,
-		clientApplicationTrafficLabel, hs.transcript)
+		hs_clientApplicationTrafficLabel, hs.transcript) // 标签现在是 string
 	serverSecret := hs.suite.deriveSecret(hs.masterSecret,
-		serverApplicationTrafficLabel, hs.transcript)
+		hs_serverApplicationTrafficLabel, hs.transcript) // 标签现在是 string
 	c.out.setTrafficSecret(hs.suite, serverSecret)
 
 	err := c.config.writeKeyLog(keyLogLabelClientTraffic, hs.clientHello.random, hs.trafficSecret)
@@ -689,9 +739,6 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 
 	return nil
 }
-
-// ... (文件其余部分保持不变)
-
 
 func (hs *serverHandshakeStateTLS13) shouldSendSessionTickets() bool {
 	if hs.c.config.SessionTicketsDisabled {
@@ -721,7 +768,7 @@ func (hs *serverHandshakeStateTLS13) sendSessionTickets() error {
 	}
 
 	resumptionSecret := hs.suite.deriveSecret(hs.masterSecret,
-		resumptionLabel, hs.transcript)
+		hs_resumptionLabel, hs.transcript) // 标签现在是 string
 
 	m := new(newSessionTicketMsgTLS13)
 
@@ -813,10 +860,11 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 			return err
 		}
 
+		// Corrected: Declare certVerify here.
 		certVerify, ok := msg.(*certificateVerifyMsg)
 		if !ok {
 			c.sendAlert(alertUnexpectedMessage)
-			return unexpectedMessageError(certVerify, msg)
+			return unexpectedMessageError(certVerify, msg) // Use msg here, not certVerifyMsg
 		}
 
 		// See RFC 8446, Section 4.4.3.
@@ -871,6 +919,31 @@ func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 	}
 
 	c.in.setTrafficSecret(hs.suite, hs.trafficSecret)
+
+	return nil
+}
+
+func (hs *serverHandshakeStateTLS13) establishHandshakeSecrets() error {
+	c := hs.c
+
+	// Set the early secret.
+	if hs.usingPSK {
+		hs.earlySecret = hs.suite.extract(hs.clientHello.pskIdentities[0].label, nil) // Corrected to .label
+	} else {
+		hs.earlySecret = hs.suite.extract(nil, nil)
+	}
+
+	derivedSecret := hs.suite.deriveSecret(hs.earlySecret, hs_derivedSecretLabel, nil) // 标签现在是 string
+	hs.handshakeSecret = hs.suite.extract(hs.sharedKey, derivedSecret)
+
+	clientHandshakeTrafficSecret := hs.suite.deriveSecret(hs.handshakeSecret, hs_clientHandshakeTrafficLabel, hs.transcript) // 标签现在是 string
+	serverHandshakeTrafficSecret := hs.suite.deriveSecret(hs.handshakeSecret, hs_serverHandshakeTrafficLabel, hs.transcript) // 标签现在是 string
+
+	c.in.setTrafficSecret(hs.suite, clientHandshakeTrafficSecret)
+	c.out.setTrafficSecret(hs.suite, serverHandshakeTrafficSecret)
+
+	// Corrected: Ensure masterSecret is derived using a string label
+	hs.masterSecret = hs.suite.deriveSecret(hs.handshakeSecret, hs_masterSecretLabel, hs.transcript) // 标签现在是 string
 
 	return nil
 }
