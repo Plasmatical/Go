@@ -27,7 +27,7 @@ Key features:
     - The receiver decrypts and validates the EEM, checking the nonce and verifying the cryptographic binding to the payload.
 5. **Traffic Pattern Library (TPL)**: Both sides maintain a set of legitimate traffic patterns (mode IDs, seeds, parameters) to dynamically adjust packet size, timing, and burst behavior.
 
-For complete protocol details, see [`SPEC.md`](./SPEC.md).
+For complete protocol details, see [`SPEC.txt`](./SPEC.txt).
 
 ## Usage
 
@@ -84,7 +84,7 @@ if err != nil {
 - **TLS Best Practices:** Always use strong TLS versions and ciphers. Plasmatic does not replace the underlying TLS security.
 - **Pattern Diversity:** Regularly update and diversify TPL patterns to avoid detection by statistical analysis.
 
-For more detailed threat models and operational recommendations, see the "Security Considerations" section in [`SPEC.md`](./SPEC.md).
+For more detailed threat models and operational recommendations, see the "Security Considerations" section in [`SPEC.txt`](./SPEC.txt).
 
 ## References
 
