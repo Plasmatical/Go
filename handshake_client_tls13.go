@@ -14,6 +14,8 @@ import (
 	"hash"
 	"sync/atomic"
 	"time"
+
+	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
 )
 
 type clientHandshakeStateTLS13 struct {
@@ -78,7 +80,7 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 	if err := hs.sendDummyChangeCipherSpec(); err != nil {
 		return err
 	}
-	if err := hs.establishHandshakeKeys(); err != nil {
+	if err := hs.establishHandshakeKeys(); err != nil { // masterSecret 在这里被填充
 		return err
 	}
 	if err := hs.readServerParameters(); err != nil {
@@ -375,7 +377,7 @@ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 		return err
 	}
 
-	hs.masterSecret = hs.suite.extract(nil,
+	hs.masterSecret = hs.suite.extract(nil, // masterSecret 在这里被填充
 		hs.suite.deriveSecret(handshakeSecret, "derived", nil))
 
 	return nil
