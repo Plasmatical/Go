@@ -21,6 +21,19 @@ import (
 	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
 )
 
+// TLS 1.3 secret labels (added for self-containment, ideally in common.go)
+const (
+	derivedSecretLabel          = "derived"
+	clientHandshakeTrafficLabel = "c hs traffic"
+	serverHandshakeTrafficLabel = "s hs traffic"
+	clientApplicationTrafficLabel = "c ap traffic"
+	serverApplicationTrafficLabel = "s ap traffic"
+	exporterLabel               = "exporter"
+	resumptionLabel             = "resumption"
+	resumptionBinderLabel       = "resumption binder"
+	masterSecretLabel           = "master secret" // Corrected to string
+)
+
 // maxClientPSKIdentities is the number of client PSK identities the server will
 // attempt to validate. It will ignore the rest not to let cheap ClientHello
 // messages cause too much work in session ticket decryption attempts.
@@ -95,6 +108,9 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	serverInitialNonce := plasmatic.DeriveInitialNonce(serverEEMKey, false)
 	
 	var plasmaticErr error // 声明 plasmaticErr 变量
+	// ** IMPORTANT: c.PlasmaticServerConn field must be defined in tls.Conn (conn.go) **
+	// If you encounter "undefined (type *Conn has no field or method PlasmaticServerConn)" error,
+	// please add `PlasmaticServerConn *plasmatic.PlasmaticConn` to the tls.Conn struct in conn.go.
 	c.PlasmaticServerConn, plasmaticErr = plasmatic.NewPlasmaticConn(serverEEMKey, serverInitialNonce, false)
 	if plasmaticErr != nil {
 		return fmt.Errorf("tls: failed to initialize PlasmaticServerConn: %w", plasmaticErr)
@@ -104,9 +120,12 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	// The client's application traffic secret is derived by the client, but the server needs
 	// to know how to derive the expected incoming nonce.
 	// We re-derive it here using the master secret and transcript state after client finished.
-	clientTrafficSecret := hs.suite.deriveSecret(hs.masterSecret, clientApplicationTrafficLabel, hs.transcript)
+	clientTrafficSecret := hs.suite.deriveSecret([]byte(hs.masterSecret), clientApplicationTrafficLabel, hs.transcript) // Cast to []byte if masterSecret is not already
 	clientInitialNonce := plasmatic.DeriveInitialNonce(clientTrafficSecret, true)
 	
+	// ** IMPORTANT: c.PlasmaticClientConn field must be defined in tls.Conn (conn.go) **
+	// If you encounter "undefined (type *Conn has no field or method PlasmaticClientConn)" error,
+	// please add `PlasmaticClientConn *plasmatic.PlasmaticConn` to the tls.Conn struct in conn.go.
 	c.PlasmaticClientConn, plasmaticErr = plasmatic.NewPlasmaticConn(clientTrafficSecret, clientInitialNonce, true)
 	if plasmaticErr != nil {
 		return fmt.Errorf("tls: failed to initialize PlasmaticClientConn: %w", plasmaticErr)
@@ -561,7 +580,7 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 		earlySecret = hs.suite.extract(nil, nil)
 	}
 	handshakeSecret := hs.suite.extract(hs.sharedKey,
-		hs.suite.deriveSecret(earlySecret, "derived", nil))
+		hs.suite.deriveSecret(earlySecret, derivedSecretLabel, nil)) // Use derivedSecretLabel
 
 	clientSecret := hs.suite.deriveSecret(handshakeSecret,
 		clientHandshakeTrafficLabel, hs.transcript)
@@ -688,7 +707,7 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 	// Derive secrets that take context through the server Finished.
 
 	hs.masterSecret = hs.suite.extract(nil, // masterSecret 在这里被填充
-		hs.suite.deriveSecret(hs.handshakeSecret, "derived", nil))
+		hs.suite.deriveSecret(hs.handshakeSecret, derivedSecretLabel, nil)) // Use derivedSecretLabel
 
 	hs.trafficSecret = hs.suite.deriveSecret(hs.masterSecret,
 		clientApplicationTrafficLabel, hs.transcript)
@@ -841,10 +860,11 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 			return err
 		}
 
+		// Corrected: Declare certVerify here.
 		certVerify, ok := msg.(*certificateVerifyMsg)
 		if !ok {
 			c.sendAlert(alertUnexpectedMessage)
-			return unexpectedMessageError(certVerify, certVerifyMsg)
+			return unexpectedMessageError(certVerify, msg) // Use msg here, not certVerifyMsg
 		}
 
 		// See RFC 8446, Section 4.4.3.
@@ -908,12 +928,12 @@ func (hs *serverHandshakeStateTLS13) establishHandshakeSecrets() error {
 
 	// Set the early secret.
 	if hs.usingPSK {
-		hs.earlySecret = hs.suite.extract(hs.clientHello.pskIdentities[0].identity, nil)
+		hs.earlySecret = hs.suite.extract(hs.clientHello.pskIdentities[0].label, nil) // Corrected to .label
 	} else {
 		hs.earlySecret = hs.suite.extract(nil, nil)
 	}
 
-	derivedSecret := hs.suite.deriveSecret(hs.earlySecret, derivedSecretLabel, hs.transcript)
+	derivedSecret := hs.suite.deriveSecret(hs.earlySecret, derivedSecretLabel, nil) // Use derivedSecretLabel
 	hs.handshakeSecret = hs.suite.extract(hs.sharedKey, derivedSecret)
 
 	clientHandshakeTrafficSecret := hs.suite.deriveSecret(hs.handshakeSecret, clientHandshakeTrafficLabel, hs.transcript)
@@ -922,6 +942,7 @@ func (hs *serverHandshakeStateTLS13) establishHandshakeSecrets() error {
 	c.in.setTrafficSecret(hs.suite, clientHandshakeTrafficSecret)
 	c.out.setTrafficSecret(hs.suite, serverHandshakeTrafficSecret)
 
+	// Corrected: Ensure masterSecret is derived using a string label
 	hs.masterSecret = hs.suite.deriveSecret(hs.handshakeSecret, masterSecretLabel, hs.transcript)
 
 	return nil
