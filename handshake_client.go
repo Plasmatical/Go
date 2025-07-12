@@ -1,3 +1,7 @@
+// Copyright 2009 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package tls
 
 import (
@@ -64,18 +68,18 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 	}
 
 	hello := &clientHelloMsg{
-		vers:                       clientHelloVersion,
-		compressionMethods:         []uint8{compressionNone},
-		random:                     make([]byte, 32),
-		sessionId:                  make([]byte, 32),
-		ocspStapling:               true,
-		scts:                       true,
-		serverName:                 hostnameInSNI(config.ServerName),
-		supportedCurves:            config.curvePreferences(),
-		supportedPoints:            []uint8{pointFormatUncompressed},
+		vers:                         clientHelloVersion,
+		compressionMethods:           []uint8{compressionNone},
+		random:                       make([]byte, 32),
+		sessionId:                    make([]byte, 32),
+		ocspStapling:                 true,
+		scts:                         true,
+		serverName:                   hostnameInSNI(config.ServerName),
+		supportedCurves:              config.curvePreferences(),
+		supportedPoints:              []uint8{pointFormatUncompressed},
 		secureRenegotiationSupported: true,
-		alpnProtocols:              config.NextProtos,
-		supportedVersions:          supportedVersions,
+		alpnProtocols:                config.NextProtos,
+		supportedVersions:            supportedVersions,
 	}
 
 	if c.handshakes > 0 {
@@ -217,9 +221,9 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 		err = hs.handshake()
 		if err == nil {
 			// TLS 1.3 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
-			// hs.masterSecret 应该由 clientHandshakeStateTLS13.handshake() 填充。
+			// hs.masterSecret 应该由 clientHandshakeStateTLS13.handshake() 内部的 establishHandshakeKeys() 填充。
 			if hs.masterSecret == nil {
-				return errors.New("tls: TLS 1.3 handshake completed but masterSecret is nil. Please ensure clientHandshakeStateTLS13.handshake() populates hs.masterSecret.")
+				return errors.New("tls: TLS 1.3 handshake completed but masterSecret is nil. This indicates an issue in handshake_client_tls13.go's logic.")
 			}
 			plasmatic.TLSSharedKey = hs.masterSecret
 		}
@@ -242,7 +246,7 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 	// TLS 1.0-1.2 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
 	// hs.masterSecret 应该由 hs.handshake() 内部的 establishKeys() 填充。
 	if hs.masterSecret == nil {
-		return errors.New("tls: TLS 1.0-1.2 handshake completed but masterSecret is nil. Please ensure hs.handshake() populates hs.masterSecret.")
+		return errors.New("tls: TLS 1.0-1.2 handshake completed but masterSecret is nil. This indicates an issue in handshake_client.go's handshake() logic.")
 	}
 	plasmatic.TLSSharedKey = hs.masterSecret // 传递 masterSecret
 
@@ -254,6 +258,9 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 
 	return nil
 }
+
+// ... (文件其余部分保持不变)
+
 
 func (c *Conn) loadSession(hello *clientHelloMsg) (cacheKey string,
 	session *ClientSessionState, earlySecret, binderKey []byte) {
