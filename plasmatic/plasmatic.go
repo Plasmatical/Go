@@ -17,6 +17,11 @@ import (
 	"golang.org/x/crypto/chacha20poly1305" 
 )
 
+// TLSSharedKey 是从 TLS 握手协商得到的共享密钥（masterSecret）。
+// 外部 TLS 代码应在握手完成后设置此变量。
+// 这是一个全局变量，因为它代表了整个连接的共享密钥。
+var TLSSharedKey []byte
+
 // PlasmaticConn represents the state for the Plasmatic protocol on one half-connection (send or receive).
 type PlasmaticConn struct {
 	eemKey []byte // Shared symmetric key for EEM encryption/decryption
