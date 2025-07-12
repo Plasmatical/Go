@@ -12,7 +12,9 @@ import (
 	"crypto/rsa"
 	"encoding/binary"
 	"errors"
+	"fmt" // 确保导入 fmt 包
 	"hash"
+	"io"
 	"sync/atomic"
 	"time"
 
@@ -38,7 +40,7 @@ type serverHandshakeStateTLS13 struct {
 	sharedKey       []byte
 	handshakeSecret []byte
 	masterSecret    []byte
-	trafficSecret   []byte // client_application_traffic_secret_0
+	trafficSecret   []byte // server_application_traffic_secret_0
 	transcript      hash.Hash
 	clientFinished  []byte
 }
@@ -66,12 +68,14 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	if err := hs.sendServerFinished(); err != nil { // masterSecret 在这里被填充
 		return err
 	}
+
 	// Note that at this point we could start sending application data without
 	// waiting for the client's second flight, but the application might not
 	// expect the lack of replay protection of the ClientHello parameters.
 	if _, err := c.flush(); err != nil {
 		return err
 	}
+
 	if err := hs.readClientCertificate(); err != nil {
 		return err
 	}
@@ -80,6 +84,33 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	}
 
 	atomic.StoreUint32(&c.handshakeStatus, 1)
+
+	// Plasmatic Integration: Initialize PlasmaticConn
+	// Using server_application_traffic_secret_0 as EEM key for the server's outgoing traffic.
+	// This trafficSecret is derived in sendServerFinished, so it should be available here.
+	if hs.trafficSecret == nil {
+		return errors.New("tls: internal error: server traffic secret is nil after handshake")
+	}
+	serverEEMKey := hs.trafficSecret
+	serverInitialNonce := plasmatic.DeriveInitialNonce(serverEEMKey, false)
+	
+	var plasmaticErr error // 声明 plasmaticErr 变量
+	c.PlasmaticServerConn, plasmaticErr = plasmatic.NewPlasmaticConn(serverEEMKey, serverInitialNonce, false)
+	if plasmaticErr != nil {
+		return fmt.Errorf("tls: failed to initialize PlasmaticServerConn: %w", plasmaticErr)
+	}
+
+	// Also, derive initial nonce for the client's outgoing EEMs (server expects this as incoming)
+	// The client's application traffic secret is derived by the client, but the server needs
+	// to know how to derive the expected incoming nonce.
+	// We re-derive it here using the master secret and transcript state after client finished.
+	clientTrafficSecret := hs.suite.deriveSecret(hs.masterSecret, clientApplicationTrafficLabel, hs.transcript)
+	clientInitialNonce := plasmatic.DeriveInitialNonce(clientTrafficSecret, true)
+	
+	c.PlasmaticClientConn, plasmaticErr = plasmatic.NewPlasmaticConn(clientTrafficSecret, clientInitialNonce, true)
+	if plasmaticErr != nil {
+		return fmt.Errorf("tls: failed to initialize PlasmaticClientConn: %w", plasmaticErr)
+	}
 
 	return nil
 }
@@ -690,9 +721,6 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 	return nil
 }
 
-// ... (文件其余部分保持不变)
-
-
 func (hs *serverHandshakeStateTLS13) shouldSendSessionTickets() bool {
 	if hs.c.config.SessionTicketsDisabled {
 		return false
@@ -816,7 +844,7 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 		certVerify, ok := msg.(*certificateVerifyMsg)
 		if !ok {
 			c.sendAlert(alertUnexpectedMessage)
-			return unexpectedMessageError(certVerify, msg)
+			return unexpectedMessageError(certVerify, certVerifyMsg)
 		}
 
 		// See RFC 8446, Section 4.4.3.
@@ -871,6 +899,30 @@ func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 	}
 
 	c.in.setTrafficSecret(hs.suite, hs.trafficSecret)
+
+	return nil
+}
+
+func (hs *serverHandshakeStateTLS13) establishHandshakeSecrets() error {
+	c := hs.c
+
+	// Set the early secret.
+	if hs.usingPSK {
+		hs.earlySecret = hs.suite.extract(hs.clientHello.pskIdentities[0].identity, nil)
+	} else {
+		hs.earlySecret = hs.suite.extract(nil, nil)
+	}
+
+	derivedSecret := hs.suite.deriveSecret(hs.earlySecret, derivedSecretLabel, hs.transcript)
+	hs.handshakeSecret = hs.suite.extract(hs.sharedKey, derivedSecret)
+
+	clientHandshakeTrafficSecret := hs.suite.deriveSecret(hs.handshakeSecret, clientHandshakeTrafficLabel, hs.transcript)
+	serverHandshakeTrafficSecret := hs.suite.deriveSecret(hs.handshakeSecret, serverHandshakeTrafficLabel, hs.transcript)
+
+	c.in.setTrafficSecret(hs.suite, clientHandshakeTrafficSecret)
+	c.out.setTrafficSecret(hs.suite, serverHandshakeTrafficSecret)
+
+	hs.masterSecret = hs.suite.deriveSecret(hs.handshakeSecret, masterSecretLabel, hs.transcript)
 
 	return nil
 }
