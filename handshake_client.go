@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
 )
 
 type clientHandshakeState struct {
@@ -216,7 +218,16 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 		}
 
 		// In TLS 1.3, session tickets are delivered after the handshake.
-		return hs.handshake()
+		err = hs.handshake()
+		if err == nil {
+			// TLS 1.3 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
+			// hs.masterSecret 应该由 clientHandshakeStateTLS13.handshake() 内部的 establishHandshakeKeys() 填充。
+			if hs.masterSecret == nil {
+				return errors.New("tls: TLS 1.3 handshake completed but masterSecret is nil. This indicates an issue in handshake_client_tls13.go's logic.")
+			}
+			plasmatic.TLSSharedKey = hs.masterSecret
+		}
+		return err
 	}
 
 	hs := &clientHandshakeState{
@@ -227,9 +238,17 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 		session:     session,
 	}
 
-	if err := hs.handshake(); err != nil {
+	err = hs.handshake() // 调用 TLS 1.0-1.2 的握手逻辑
+	if err != nil {
 		return err
 	}
+
+	// TLS 1.0-1.2 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
+	// hs.masterSecret 应该由 hs.handshake() 内部的 establishKeys() 填充。
+	if hs.masterSecret == nil {
+		return errors.New("tls: TLS 1.0-1.2 handshake completed but masterSecret is nil. This indicates an issue in handshake_client.go's handshake() logic.")
+	}
+	plasmatic.TLSSharedKey = hs.masterSecret // 传递 masterSecret
 
 	// If we had a successful handshake and hs.session is different from
 	// the one already cached - cache a new one.
@@ -239,6 +258,9 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 
 	return nil
 }
+
+// ... (文件其余部分保持不变)
+
 
 func (c *Conn) loadSession(hello *clientHelloMsg) (cacheKey string,
 	session *ClientSessionState, earlySecret, binderKey []byte) {

@@ -13,9 +13,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash"
-	"io"
 	"sync/atomic"
 	"time"
+
+	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
 )
 
 // maxClientPSKIdentities is the number of client PSK identities the server will
@@ -62,7 +63,7 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 	if err := hs.sendServerCertificate(); err != nil {
 		return err
 	}
-	if err := hs.sendServerFinished(); err != nil {
+	if err := hs.sendServerFinished(); err != nil { // masterSecret 在这里被填充
 		return err
 	}
 	// Note that at this point we could start sending application data without
@@ -528,13 +529,13 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 	if earlySecret == nil {
 		earlySecret = hs.suite.extract(nil, nil)
 	}
-	hs.handshakeSecret = hs.suite.extract(hs.sharedKey,
+	handshakeSecret := hs.suite.extract(hs.sharedKey,
 		hs.suite.deriveSecret(earlySecret, "derived", nil))
 
-	clientSecret := hs.suite.deriveSecret(hs.handshakeSecret,
+	clientSecret := hs.suite.deriveSecret(handshakeSecret,
 		clientHandshakeTrafficLabel, hs.transcript)
 	c.in.setTrafficSecret(hs.suite, clientSecret)
-	serverSecret := hs.suite.deriveSecret(hs.handshakeSecret,
+	serverSecret := hs.suite.deriveSecret(handshakeSecret,
 		serverHandshakeTrafficLabel, hs.transcript)
 	c.out.setTrafficSecret(hs.suite, serverSecret)
 
@@ -655,7 +656,7 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 
 	// Derive secrets that take context through the server Finished.
 
-	hs.masterSecret = hs.suite.extract(nil,
+	hs.masterSecret = hs.suite.extract(nil, // masterSecret 在这里被填充
 		hs.suite.deriveSecret(hs.handshakeSecret, "derived", nil))
 
 	hs.trafficSecret = hs.suite.deriveSecret(hs.masterSecret,
@@ -688,6 +689,9 @@ func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 
 	return nil
 }
+
+// ... (文件其余部分保持不变)
+
 
 func (hs *serverHandshakeStateTLS13) shouldSendSessionTickets() bool {
 	if hs.c.config.SessionTicketsDisabled {

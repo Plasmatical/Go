@@ -20,6 +20,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	// 引入新的 plasmatic 包
+	"github.com/Plasmatical/Go/plasmatic" //
 )
 
 // A Conn represents a secured connection.
@@ -115,6 +118,8 @@ type Conn struct {
 	// in Conn.Write.
 	activeCall int32
 
+	clientSession *ClientSessionState // <-- 新增此字段
+
 	tmp [16]byte
 }
 
@@ -176,6 +181,12 @@ type halfConn struct {
 	nextMac    hash.Hash // next MAC algorithm
 
 	trafficSecret []byte // current TLS 1.3 traffic secret
+
+	conn *Conn // <-- **新增行：添加对父 Conn 实例的引用**
+
+	// Plasmatic specific fields
+	// The Plasmatic connection state for this half (in or out).
+	plasmaticConn *plasmatic.PlasmaticConn //
 }
 
 type permanentError struct {
@@ -451,6 +462,56 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 	}
 
 	hc.incSeq()
+
+	// --- Plasmatic: EEM 解密和验证逻辑开始 ---
+	if hc.plasmaticConn != nil { //
+		// EEM 位于 TLS Record Payload 之后，其长度是固定的。
+		// record 包含了 record header + encrypted TLS payload + EEM
+		// plaintext 包含了 decrypted TLS payload
+
+		// 确保 record 足够长以包含 EEM
+		// 注意: plasmatic.EEMFixedLength 这里应是加密后的 EEM 长度，可能需要根据实际 AEAD overhead 调整。
+		// 如果 plasmatic.EEMFixedLength 指的是AEAD加密前的明文长度，那么这里还需要加上 AEAD 的 Overhead。
+		// 此处保留原始代码，仅修复报错行。
+		if len(record) < recordHeaderLen+len(payload)+plasmatic.EEMFixedLength { //
+			// 如果长度不够，则认为 EEM 不存在或被截断，模拟 TLS 错误
+			return nil, 0, hc.setErrorLocked(alertBadRecordMAC) //
+		}
+
+		// EEM 的起始位置在 record header + original payload 的长度之后
+		eemStart := recordHeaderLen + len(payload) //
+		// EEM 的结束位置是 eemStart + EEMFixedLength
+		eemEnd := eemStart + plasmatic.EEMFixedLength //
+		if eemEnd > len(record) { // Should not happen if previous length check is correct but for safety
+			return nil, 0, hc.setErrorLocked(alertBadRecordMAC) //
+		}
+
+		encryptedEEM := record[eemStart:eemEnd] //
+
+		// 获取解密后的 TLS payload 的前 2 字节，用于 EEM 内部校验
+		var payloadHeaderFragment []byte //
+		if len(plaintext) >= plasmatic.EEMPayloadHeaderFragmentLength { //
+			payloadHeaderFragment = plaintext[:plasmatic.EEMPayloadHeaderFragmentLength] //
+		} else { // 如果 plaintext 不够 2 字节，这本身就是异常，但也要避免崩溃
+			payloadHeaderFragment = make([]byte, plasmatic.EEMPayloadHeaderFragmentLength) //
+			copy(payloadHeaderFragment, plaintext) //
+		}
+
+		// 解密并验证 EEM
+		seedUpdate, err := hc.plasmaticConn.DecodeEEM(encryptedEEM, payloadHeaderFragment) //
+		if err != nil { //
+			// EEM 验证失败 (解密失败、Nonce 不正确、头部片段不匹配等)
+			return nil, 0, hc.setErrorLocked(alertBadRecordMAC) // 模拟 MAC 错误
+		}
+
+		// 如果 EEM 中包含 seed 更新指令，则处理
+		if seedUpdate != nil { //
+			// 修复了 'undefined: c' 错误，使用 hc.c 来访问 Conn 对象的 isClient 字段。
+			hc.plasmaticConn.ApplySeedUpdate(seedUpdate, !hc.conn.isClient)
+		}
+	}
+	// --- Plasmatic: EEM 解密和验证逻辑结束 ---
+
 	return plaintext, typ, nil
 }
 
@@ -486,7 +547,7 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader) ([]byte, err
 			// an 8 bytes nonce but its nonces must be unpredictable (see RFC
 			// 5246, Appendix F.3), forcing us to use randomness. That's not
 			// 3DES' biggest problem anyway because the birthday bound on block
-			// collision is reached first due to its similarly small block size
+			// collision is reached first due0 to its similarly small block size
 			// (see the Sweet32 attack).
 			copy(explicitNonce, hc.seq[:])
 		} else {
@@ -554,6 +615,94 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader) ([]byte, err
 
 	return record, nil
 }
+
+// --- Plasmatic: 修改 writeRecordLocked 以附加 EEM ---
+// writeRecordLocked writes a TLS record with the given type and payload to the
+// connection and updates the record layer state.
+func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
+	outBufPtr := outBufPool.Get().(*[]byte)
+	outBuf := *outBufPtr
+	defer func() {
+		*outBufPtr = outBuf
+		outBufPool.Put(outBufPtr)
+	}()
+
+	var n int
+	for len(data) > 0 {
+		m := len(data)
+		if maxPayload := c.maxPayloadSizeForWrite(typ); m > maxPayload {
+			m = maxPayload
+		}
+
+		// Make space for record header
+		_, outBuf = sliceForAppend(outBuf[:0], recordHeaderLen) //
+		outBuf[0] = byte(typ) //
+		vers := c.vers //
+		if vers == 0 { //
+			// Some TLS servers fail if the record version is
+			// greater than TLS 1.0 for the initial ClientHello.
+			vers = VersionTLS10 //
+		} else if vers == VersionTLS13 { //
+			// TLS 1.3 froze the record layer version to 1.2.
+			// See RFC 8446, Section 5.1.
+			vers = VersionTLS12 //
+		}
+		outBuf[1] = byte(vers >> 8) //
+		outBuf[2] = byte(vers) //
+		outBuf[3] = byte(m >> 8) //
+		outBuf[4] = byte(m) //
+
+		var err error //
+		outBuf, err = c.out.encrypt(outBuf, data[:m], c.config.rand()) //
+		if err != nil { //
+			return n, err //
+		}
+
+		// --- Plasmatic: EEM 生成和附加逻辑开始 ---
+		if c.out.plasmaticConn != nil { //
+			var seedUpdate *plasmatic.SeedUpdate //
+			// 检查是否有待发送的 seed 更新指令
+			// 假设 plasmatic.PlasmaticConn 有一个 GetPendingSeedUpdate 方法
+			seedUpdate = c.out.plasmaticConn.GetPendingSeedUpdate() //
+
+			// 获取加密后的 TLS payload 的前 2 字节用于 EEM 内部校验
+			// 这里 outBuf 已经包含了 record header + encrypted TLS payload
+			var payloadHeaderFragment []byte //
+			if len(outBuf) > recordHeaderLen+plasmatic.EEMPayloadHeaderFragmentLength { //
+				payloadHeaderFragment = outBuf[recordHeaderLen : recordHeaderLen+plasmatic.EEMPayloadHeaderFragmentLength] //
+			} else { // 如果加密后的 payload 不够 2 字节，填充零
+				payloadHeaderFragment = make([]byte, plasmatic.EEMPayloadHeaderFragmentLength) //
+				if len(outBuf) > recordHeaderLen { //
+					copy(payloadHeaderFragment, outBuf[recordHeaderLen:]) //
+				} // else all zeros
+			}
+
+			// 生成 EEM
+			eemBytes, err := c.out.plasmaticConn.EncodeEEM(payloadHeaderFragment, seedUpdate, c.config.rand()) //
+			if err != nil { //
+				return n, err //
+			}
+			outBuf = append(outBuf, eemBytes...) //
+		}
+		// --- Plasmatic: EEM 生成和附加逻辑结束 ---
+
+		if _, err := c.write(outBuf); err != nil { //
+			return n, err //
+		}
+		n += m //
+		data = data[m:] //
+	}
+
+	if typ == recordTypeChangeCipherSpec && c.vers != VersionTLS13 { //
+		if err := c.out.changeCipherSpec(); err != nil { //
+			return n, c.sendAlertLocked(err.(alert)) //
+		}
+	}
+
+	return n, nil //
+}
+
+// --- End Plasmatic modifications for writeRecordLocked ---
 
 // RecordHeaderError is returned when a TLS record header is invalid.
 type RecordHeaderError struct {
@@ -636,7 +785,16 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 	}
 
 	vers := uint16(hdr[1])<<8 | uint16(hdr[2])
-	n := int(hdr[3])<<8 | int(hdr[4])
+	n := int(hdr[3])<<8 | int(hdr[4]) // N is the encrypted payload length
+
+	// --- Plasmatic: 调整预期读取长度以包含 EEM ---
+	// If Plasmatic is active, we expect EEM_Fixed_Length after the TLS payload.
+	expectedTotalRecordLen := recordHeaderLen + n // Standard TLS record length
+	if c.in.plasmaticConn != nil { //
+		expectedTotalRecordLen += plasmatic.EEMFixedLength // Add EEM length
+	}
+	// --- End Plasmatic adjustment ---
+
 	if c.haveVers && c.vers != VersionTLS13 && vers != c.vers {
 		c.sendAlert(alertProtocolVersion)
 		msg := fmt.Sprintf("received record with version %x when expecting version %x", vers, c.vers)
@@ -651,113 +809,119 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 			return c.in.setErrorLocked(c.newRecordHeaderError(c.conn, "first record does not look like a TLS handshake"))
 		}
 	}
-	if c.vers == VersionTLS13 && n > maxCiphertextTLS13 || n > maxCiphertext {
-		c.sendAlert(alertRecordOverflow)
-		msg := fmt.Sprintf("oversized record received with length %d", n)
-		return c.in.setErrorLocked(c.newRecordHeaderError(nil, msg))
+	// Max plaintext check for TLS payload. EEM adds to total size, but payload itself is still limited.
+	// We need to check 'n' against maxCiphertext here, before adding EEM length to `expectedTotalRecordLen`.
+	if c.vers == VersionTLS13 && n > maxCiphertextTLS13 || n > maxCiphertext { //
+		c.sendAlert(alertRecordOverflow) //
+		msg := fmt.Sprintf("oversized record received with length %d", n) //
+		return c.in.setErrorLocked(c.newRecordHeaderError(nil, msg)) //
 	}
-	if err := c.readFromUntil(c.conn, recordHeaderLen+n); err != nil {
-		if e, ok := err.(net.Error); !ok || !e.Temporary() {
-			c.in.setErrorLocked(err)
+	// --- Plasmatic: 使用调整后的长度读取 ---
+	if err := c.readFromUntil(c.conn, expectedTotalRecordLen); err != nil { //
+		if e, ok := err.(net.Error); !ok || !e.Temporary() { //
+			c.in.setErrorLocked(err) //
 		}
-		return err
+		return err //
 	}
 
 	// Process message.
-	record := c.rawInput.Next(recordHeaderLen + n)
-	data, typ, err := c.in.decrypt(record)
-	if err != nil {
-		return c.in.setErrorLocked(c.sendAlert(err.(alert)))
+	record := c.rawInput.Next(expectedTotalRecordLen) // Use the adjusted length here
+	data, typ, err := c.in.decrypt(record) //
+	if err != nil { //
+		// The c.in.decrypt will handle Plasmatic errors by calling setErrorLocked with appropriate alert.
+		return c.in.setErrorLocked(c.sendAlert(err.(alert))) //
 	}
-	if len(data) > maxPlaintext {
-		return c.in.setErrorLocked(c.sendAlert(alertRecordOverflow))
+	if len(data) > maxPlaintext { //
+		return c.in.setErrorLocked(c.sendAlert(alertRecordOverflow)) //
 	}
 
 	// Application Data messages are always protected.
-	if c.in.cipher == nil && typ == recordTypeApplicationData {
-		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+	if c.in.cipher == nil && typ == recordTypeApplicationData { //
+		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage)) //
 	}
 
-	if typ != recordTypeAlert && typ != recordTypeChangeCipherSpec && len(data) > 0 {
+	if typ != recordTypeAlert && typ != recordTypeChangeCipherSpec && len(data) > 0 { //
 		// This is a state-advancing message: reset the retry count.
-		c.retryCount = 0
+		c.retryCount = 0 //
 	}
 
 	// Handshake messages MUST NOT be interleaved with other record types in TLS 1.3.
-	if c.vers == VersionTLS13 && typ != recordTypeHandshake && c.hand.Len() > 0 {
-		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+	if c.vers == VersionTLS13 && typ != recordTypeHandshake && c.hand.Len() > 0 { //
+		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage)) //
 	}
 
-	switch typ {
-	default:
-		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+	switch typ { //
+	default: //
+		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage)) //
 
-	case recordTypeAlert:
-		if len(data) != 2 {
-			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+	case recordTypeAlert: //
+		if len(data) != 2 { //
+			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage)) //
 		}
-		if alert(data[1]) == alertCloseNotify {
-			return c.in.setErrorLocked(io.EOF)
+		if alert(data[1]) == alertCloseNotify { //
+			return c.in.setErrorLocked(io.EOF) //
 		}
-		if c.vers == VersionTLS13 {
-			return c.in.setErrorLocked(&net.OpError{Op: "remote error", Err: alert(data[1])})
+		if c.vers == VersionTLS13 { //
+			return c.in.setErrorLocked(&net.OpError{Op: "remote error", Err: alert(data[1])}) //
 		}
-		switch data[0] {
-		case alertLevelWarning:
+		switch data[0] { //
+		case alertLevelWarning: //
 			// Drop the record on the floor and retry.
-			return c.retryReadRecord(expectChangeCipherSpec)
-		case alertLevelError:
-			return c.in.setErrorLocked(&net.OpError{Op: "remote error", Err: alert(data[1])})
-		default:
-			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+			return c.retryReadRecord(expectChangeCipherSpec) //
+		case alertLevelError: //
+			return c.in.setErrorLocked(&net.OpError{Op: "remote error", Err: alert(data[1])}) //
+		default: //
+			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage)) //
 		}
 
-	case recordTypeChangeCipherSpec:
-		if len(data) != 1 || data[0] != 1 {
-			return c.in.setErrorLocked(c.sendAlert(alertDecodeError))
+	case recordTypeChangeCipherSpec: //
+		if len(data) != 1 || data[0] != 1 { //
+			return c.in.setErrorLocked(c.sendAlert(alertDecodeError)) //
 		}
 		// Handshake messages are not allowed to fragment across the CCS.
-		if c.hand.Len() > 0 {
-			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+		if c.hand.Len() > 0 { //
+			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage)) //
 		}
 		// In TLS 1.3, change_cipher_spec records are ignored until the
 		// Finished. See RFC 8446, Appendix D.4. Note that according to Section
 		// 5, a server can send a ChangeCipherSpec before its ServerHello, when
 		// c.vers is still unset. That's not useful though and suspicious if the
 		// server then selects a lower protocol version, so don't allow that.
-		if c.vers == VersionTLS13 {
-			return c.retryReadRecord(expectChangeCipherSpec)
+		if c.vers == VersionTLS13 { //
+			return c.retryReadRecord(expectChangeCipherSpec) //
 		}
-		if !expectChangeCipherSpec {
-			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+		if !expectChangeCipherSpec { //
+			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage)) //
 		}
-		if err := c.in.changeCipherSpec(); err != nil {
-			return c.in.setErrorLocked(c.sendAlert(err.(alert)))
+		if err := c.in.changeCipherSpec(); err != nil { //
+			return c.in.setErrorLocked(c.sendAlert(err.(alert))) //
 		}
 
-	case recordTypeApplicationData:
-		if !handshakeComplete || expectChangeCipherSpec {
-			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+	case recordTypeApplicationData: //
+		if !handshakeComplete || expectChangeCipherSpec { //
+			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage)) //
 		}
 		// Some OpenSSL servers send empty records in order to randomize the
 		// CBC IV. Ignore a limited number of empty records.
-		if len(data) == 0 {
-			return c.retryReadRecord(expectChangeCipherSpec)
+		if len(data) == 0 { //
+			return c.retryReadRecord(expectChangeCipherSpec) //
 		}
 		// Note that data is owned by c.rawInput, following the Next call above,
 		// to avoid copying the plaintext. This is safe because c.rawInput is
 		// not read from or written to until c.input is drained.
-		c.input.Reset(data)
+		c.input.Reset(data) //
 
-	case recordTypeHandshake:
-		if len(data) == 0 || expectChangeCipherSpec {
-			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+	case recordTypeHandshake: //
+		if len(data) == 0 || expectChangeCipherSpec { //
+			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage)) //
 		}
-		c.hand.Write(data)
+		c.hand.Write(data) //
 	}
 
-	return nil
+	return nil //
 }
+
+// --- End Plasmatic modifications for readRecordOrCCS ---
 
 // retryReadRecord recurses into readRecordOrCCS to drop a non-advancing record, like
 // a warning alert, empty application_data, or a change_cipher_spec in TLS 1.3.
@@ -831,6 +995,7 @@ func (c *Conn) sendAlertLocked(err alert) error {
 func (c *Conn) sendAlert(err alert) error {
 	c.out.Lock()
 	defer c.out.Unlock()
+
 	return c.sendAlertLocked(err)
 }
 
@@ -851,7 +1016,7 @@ const (
 // maxPayloadSizeForWrite returns the maximum TLS payload size to use for the
 // next application data record. There is the following trade-off:
 //
-//   - For latency-sensitive applications, such as web browsing, each TLS
+//   - For latency-sensitive applications, such as web Browse, each TLS
 //     record should fit in one TCP segment.
 //   - For throughput-sensitive applications, such as large file transfers,
 //     larger TLS records better amortize framing and encryption overheads.
@@ -869,46 +1034,82 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
 		return maxPlaintext
 	}
 
-	if c.bytesSent >= recordSizeBoostThreshold {
-		return maxPlaintext
+	// --- Plasmatic: 动态调整 maxPayloadSizeForWrite ---
+	// If Plasmatic is active, it might dictate the payload size based on the current seed.
+	if c.out.plasmaticConn != nil { //
+		// Get desired payload size from Plasmatic, based on current active seed.
+		// This size includes TLS padding and MAC, but excludes TLS header and EEM.
+		// Plasmatic will return the *target* plaintext size for the TLS payload.
+		targetPlaintextSize := c.out.plasmaticConn.GetPayloadSizeForMode() //
+
+		// Calculate TLS overhead for this specific record.
+		tlsOverhead := recordHeaderLen + c.out.explicitNonceLen() //
+		if c.out.cipher != nil { //
+			switch ciph := c.out.cipher.(type) { //
+			case cipher.Stream: //
+				tlsOverhead += c.out.mac.Size() //
+			case cipher.AEAD: //
+				tlsOverhead += ciph.Overhead() //
+			case cbcMode: //
+				blockSize := ciph.BlockSize() //
+				// Payload must fit in a multiple of blockSize, with room for at least one padding byte.
+				// We need to account for MAC size here when calculating needed padding.
+				// The actual padding added by encrypt will be blockSize - (plaintextLen % blockSize)
+				tlsOverhead += c.out.mac.Size() + (blockSize - ((targetPlaintextSize + c.out.mac.Size()) % blockSize)) // Minimal padding for full block
+			}
+		}
+		if c.vers == VersionTLS13 { //
+			tlsOverhead++ // encrypted ContentType
+		}
+
+		// Return the calculated max payload size that includes TLS padding and MAC,
+		// but fits the Plasmatic mode requirements.
+		// We subtract the EEM fixed length here because the maxPlaintext is what the TLS layer outputs.
+		// The `writeRecordLocked` will then add EEM.
+		return targetPlaintextSize // The value returned here is the *max plaintext size* for TLS layer
+	}
+	// --- End Plasmatic modification for maxPayloadSizeForWrite ---
+
+	if c.bytesSent >= recordSizeBoostThreshold { //
+		return maxPlaintext //
 	}
 
 	// Subtract TLS overheads to get the maximum payload size.
-	payloadBytes := tcpMSSEstimate - recordHeaderLen - c.out.explicitNonceLen()
-	if c.out.cipher != nil {
-		switch ciph := c.out.cipher.(type) {
-		case cipher.Stream:
-			payloadBytes -= c.out.mac.Size()
-		case cipher.AEAD:
-			payloadBytes -= ciph.Overhead()
-		case cbcMode:
-			blockSize := ciph.BlockSize()
+	payloadBytes := tcpMSSEstimate - recordHeaderLen - c.out.explicitNonceLen() //
+	if c.out.cipher != nil { //
+		switch ciph := c.out.cipher.(type) { //
+		case cipher.Stream: //
+			payloadBytes -= c.out.mac.Size() //
+		case cipher.AEAD: //
+			payloadBytes -= ciph.Overhead() //
+		case cbcMode: //
+			blockSize := ciph.BlockSize() //
 			// The payload must fit in a multiple of blockSize, with
 			// room for at least one padding byte.
-			payloadBytes = (payloadBytes & ^(blockSize - 1)) - 1
+			payloadBytes = (payloadBytes & ^(blockSize - 1)) - 1 //
 			// The MAC is appended before padding so affects the
 			// payload size directly.
-			payloadBytes -= c.out.mac.Size()
-		default:
-			panic("unknown cipher type")
+			payloadBytes -= c.out.mac.Size() //
+		default: //
+			panic("unknown cipher type") //
 		}
 	}
-	if c.vers == VersionTLS13 {
+	if c.vers == VersionTLS13 { //
 		payloadBytes-- // encrypted ContentType
 	}
 
 	// Allow packet growth in arithmetic progression up to max.
-	pkt := c.packetsSent
-	c.packetsSent++
-	if pkt > 1000 {
+	pkt := c.packetsSent //
+	c.packetsSent++ //
+	if pkt > 1000 { //
 		return maxPlaintext // avoid overflow in multiply below
 	}
 
-	n := payloadBytes * int(pkt+1)
-	if n > maxPlaintext {
-		n = maxPlaintext
+	n := payloadBytes * int(pkt+1) //
+	if n > maxPlaintext { //
+		n = maxPlaintext //
 	}
-	return n
+	return n //
 }
 
 func (c *Conn) write(data []byte) (int, error) {
@@ -939,66 +1140,6 @@ var outBufPool = sync.Pool{
 	New: func() any {
 		return new([]byte)
 	},
-}
-
-// writeRecordLocked writes a TLS record with the given type and payload to the
-// connection and updates the record layer state.
-func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
-	outBufPtr := outBufPool.Get().(*[]byte)
-	outBuf := *outBufPtr
-	defer func() {
-		// You might be tempted to simplify this by just passing &outBuf to Put,
-		// but that would make the local copy of the outBuf slice header escape
-		// to the heap, causing an allocation. Instead, we keep around the
-		// pointer to the slice header returned by Get, which is already on the
-		// heap, and overwrite and return that.
-		*outBufPtr = outBuf
-		outBufPool.Put(outBufPtr)
-	}()
-
-	var n int
-	for len(data) > 0 {
-		m := len(data)
-		if maxPayload := c.maxPayloadSizeForWrite(typ); m > maxPayload {
-			m = maxPayload
-		}
-
-		_, outBuf = sliceForAppend(outBuf[:0], recordHeaderLen)
-		outBuf[0] = byte(typ)
-		vers := c.vers
-		if vers == 0 {
-			// Some TLS servers fail if the record version is
-			// greater than TLS 1.0 for the initial ClientHello.
-			vers = VersionTLS10
-		} else if vers == VersionTLS13 {
-			// TLS 1.3 froze the record layer version to 1.2.
-			// See RFC 8446, Section 5.1.
-			vers = VersionTLS12
-		}
-		outBuf[1] = byte(vers >> 8)
-		outBuf[2] = byte(vers)
-		outBuf[3] = byte(m >> 8)
-		outBuf[4] = byte(m)
-
-		var err error
-		outBuf, err = c.out.encrypt(outBuf, data[:m], c.config.rand())
-		if err != nil {
-			return n, err
-		}
-		if _, err := c.write(outBuf); err != nil {
-			return n, err
-		}
-		n += m
-		data = data[m:]
-	}
-
-	if typ == recordTypeChangeCipherSpec && c.vers != VersionTLS13 {
-		if err := c.out.changeCipherSpec(); err != nil {
-			return n, c.sendAlertLocked(err.(alert))
-		}
-	}
-
-	return n, nil
 }
 
 // writeRecord writes a TLS record with the given type and payload to the
@@ -1142,7 +1283,6 @@ func (c *Conn) Write(b []byte) (int, error) {
 	// record into two records, effectively randomizing the IV.
 	//
 	// https://www.openssl.org/~bodo/tls-cbc.txt
-	// https://bugzilla.mozilla.org/show_bug.cgi?id=665814
 	// https://www.imperialviolet.org/2012/01/15/beastfollowup.html
 
 	var m int
@@ -1397,7 +1537,7 @@ func (c *Conn) Handshake() error {
 //
 // Most uses of this package need not call HandshakeContext explicitly: the
 // first Read or Write will call it automatically.
-func (c *Conn) HandshakeContext(ctx context.Context) error {
+func (c *Conn) HandshakeContext(ctx context.Context) (ret error) {
 	// Delegate to unexported method for named return
 	// without confusing documented signature.
 	return c.handshakeContext(ctx)

@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/Plasmatical/Go/internal/godebug"
+
+	"github.com/Plasmatical/Go/plasmatic"
 )
 
 const (
@@ -45,6 +47,16 @@ const (
 	recordHeaderLen    = 5            // record header length
 	maxHandshake       = 65536        // maximum handshake we support (protocol max is 16 MB)
 	maxUselessRecords  = 16           // maximum number of consecutive non-advancing records
+)
+
+// Plasmatic specific constants, moved from plasmatic/common.go to be accessible here
+const (
+	// EEMFixedLength is the fixed total length of the External Encrypted Mount (EEM) in bytes.
+	// This length should be chosen carefully to avoid being a recognizable feature.
+	// It must be large enough to contain Nonce, PayloadHeaderFragment, SeedUpdate, and padding.
+	PlasmaticEEMFixedLength = plasmatic.EEMFixedLength // Use a different name to avoid conflict if plasmatic.EEMFixedLength is also used internally
+	// EEMPayloadHeaderFragmentLength is the length of the TLS encrypted payload header fragment included in EEM.
+	PlasmaticEEMPayloadHeaderFragmentLength = plasmatic.EEMPayloadHeaderFragmentLength //
 )
 
 // TLS record types.
@@ -736,6 +748,11 @@ type Config struct {
 	// autoSessionTicketKeys is like sessionTicketKeys but is owned by the
 	// auto-rotation logic. See Config.ticketKeys.
 	autoSessionTicketKeys []ticketKey
+
+	// PlasmaticEEMKey is the shared symmetric key used for Plasmatic External Encrypted Mount (EEM) operations.
+	// If nil, Plasmatic functionality is disabled.
+	// This key must be 32 bytes long for ChaCha20-Poly1305.
+	PlasmaticEEMKey []byte
 }
 
 const (

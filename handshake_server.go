@@ -16,8 +16,10 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"sync/atomic"
+	"sync/atomic" // 确保导入并使用
 	"time"
+
+	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
 )
 
 // serverHandshakeState contains details of a server handshake in progress.
@@ -46,20 +48,86 @@ func (c *Conn) serverHandshake(ctx context.Context) error {
 	}
 
 	if c.vers == VersionTLS13 {
+		// 假设 serverHandshakeStateTLS13 存在于 handshake_server_tls13.go 并处理 TLS 1.3 握手。
+		// 这个握手过程必须负责填充 hs.masterSecret。
 		hs := serverHandshakeStateTLS13{
 			c:           c,
 			ctx:         ctx,
 			clientHello: clientHello,
 		}
-		return hs.handshake()
+		err := hs.handshake()
+		if err == nil {
+			// TLS 1.3 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
+			// hs.masterSecret 应该由 serverHandshakeStateTLS13.handshake() 内部的 sendServerFinished() 填充。
+			if hs.masterSecret == nil {
+				return errors.New("tls: TLS 1.3 handshake completed but masterSecret is nil. This indicates an issue in handshake_server_tls13.go's logic.")
+			}
+			plasmatic.TLSSharedKey = hs.masterSecret
+		}
+		return err
 	}
 
+	// 以下是 TLS 1.0-1.2 握手路径
 	hs := serverHandshakeState{
 		c:           c,
 		ctx:         ctx,
 		clientHello: clientHello,
 	}
-	return hs.handshake()
+	
+	err = hs.handshake() // 调用 TLS 1.0-1.2 的握手逻辑
+	if err != nil {
+		return err
+	}
+
+	// TLS 1.0-1.2 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
+	// hs.masterSecret 应该由 hs.handshake() 内部的 establishKeys() 或 doResumeHandshake() 填充。
+	if hs.masterSecret == nil {
+		return errors.New("tls: TLS 1.0-1.2 handshake completed but masterSecret is nil. This indicates an issue in handshake_server.go's handshake() logic.")
+	}
+	plasmatic.TLSSharedKey = hs.masterSecret // 传递 masterSecret
+
+	return nil
+}
+
+// readClientHello reads a ClientHello message and selects the protocol version.
+func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, error) {
+	msg, err := c.readHandshake()
+	if err != nil {
+		return nil, err
+	}
+	clientHello, ok := msg.(*clientHelloMsg)
+	if !ok {
+		c.sendAlert(alertUnexpectedMessage)
+		return nil, unexpectedMessageError(clientHello, msg)
+	}
+
+	var configForClient *Config
+	originalConfig := c.config
+	if c.config.GetConfigForClient != nil {
+		chi := clientHelloInfo(ctx, c, clientHello)
+		if configForClient, err = c.config.GetConfigForClient(chi); err != nil {
+			c.sendAlert(alertInternalError)
+			return nil, err
+		} else if configForClient != nil {
+			c.config = configForClient
+		}
+	}
+	c.ticketKeys = originalConfig.ticketKeys(configForClient)
+
+	clientVersions := clientHello.supportedVersions
+	if len(clientHello.supportedVersions) == 0 {
+		clientVersions = supportedVersionsFromMax(clientHello.vers)
+	}
+	c.vers, ok = c.config.mutualVersion(roleServer, clientVersions)
+	if !ok {
+		c.sendAlert(alertProtocolVersion)
+		return nil, fmt.Errorf("tls: client offered only unsupported versions: %x", clientVersions)
+	}
+	c.haveVers = true
+	c.in.version = c.vers
+	c.out.version = c.vers
+
+	return clientHello, nil
 }
 
 func (hs *serverHandshakeState) handshake() error {
@@ -122,50 +190,9 @@ func (hs *serverHandshakeState) handshake() error {
 	}
 
 	c.ekm = ekmFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.clientHello.random, hs.hello.random)
-	atomic.StoreUint32(&c.handshakeStatus, 1)
+	atomic.StoreUint32(&c.handshakeStatus, 1) // 确保这里使用了 sync/atomic
 
 	return nil
-}
-
-// readClientHello reads a ClientHello message and selects the protocol version.
-func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, error) {
-	msg, err := c.readHandshake()
-	if err != nil {
-		return nil, err
-	}
-	clientHello, ok := msg.(*clientHelloMsg)
-	if !ok {
-		c.sendAlert(alertUnexpectedMessage)
-		return nil, unexpectedMessageError(clientHello, msg)
-	}
-
-	var configForClient *Config
-	originalConfig := c.config
-	if c.config.GetConfigForClient != nil {
-		chi := clientHelloInfo(ctx, c, clientHello)
-		if configForClient, err = c.config.GetConfigForClient(chi); err != nil {
-			c.sendAlert(alertInternalError)
-			return nil, err
-		} else if configForClient != nil {
-			c.config = configForClient
-		}
-	}
-	c.ticketKeys = originalConfig.ticketKeys(configForClient)
-
-	clientVersions := clientHello.supportedVersions
-	if len(clientHello.supportedVersions) == 0 {
-		clientVersions = supportedVersionsFromMax(clientHello.vers)
-	}
-	c.vers, ok = c.config.mutualVersion(roleServer, clientVersions)
-	if !ok {
-		c.sendAlert(alertProtocolVersion)
-		return nil, fmt.Errorf("tls: client offered only unsupported versions: %x", clientVersions)
-	}
-	c.haveVers = true
-	c.in.version = c.vers
-	c.out.version = c.vers
-
-	return clientHello, nil
 }
 
 func (hs *serverHandshakeState) processClientHello() error {
@@ -868,15 +895,15 @@ func clientHelloInfo(ctx context.Context, c *Conn, clientHello *clientHelloMsg) 
 	}
 
 	return &ClientHelloInfo{
-		CipherSuites:      clientHello.cipherSuites,
-		ServerName:        clientHello.serverName,
-		SupportedCurves:   clientHello.supportedCurves,
-		SupportedPoints:   clientHello.supportedPoints,
-		SignatureSchemes:  clientHello.supportedSignatureAlgorithms,
-		SupportedProtos:   clientHello.alpnProtocols,
+		CipherSuites:     clientHello.cipherSuites,
+		ServerName:       clientHello.serverName,
+		SupportedCurves:  clientHello.supportedCurves,
+		SupportedPoints:  clientHello.supportedPoints,
+		SignatureSchemes: clientHello.supportedSignatureAlgorithms,
+		SupportedProtos:  clientHello.alpnProtocols,
 		SupportedVersions: supportedVersions,
-		Conn:              c.conn,
-		config:            c.config,
-		ctx:               ctx,
+		Conn:             c.conn,
+		config:           c.config,
+		ctx:              ctx,
 	}
 }
