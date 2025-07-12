@@ -1,7 +1,3 @@
-// Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 package tls
 
 import (
@@ -10,7 +6,6 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
-	"crypto/rand" // 引入 crypto/rand
 	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
@@ -23,7 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Plasmatical/Go/plasmatic" // Import the plasmatic package
+	"github.com/Plasmatical/Go/plasmatic" // 导入 plasmatic 包
 )
 
 type clientHandshakeState struct {
@@ -37,84 +32,113 @@ type clientHandshakeState struct {
 	session      *ClientSessionState
 }
 
-// clientHandshake performs a TLS handshake as a client.
-func (c *Conn) clientHandshake(ctx context.Context) error {
-	if c.config == nil {
-		c.config = defaultConfig()
+func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
+	config := c.config
+	if len(config.ServerName) == 0 && !config.InsecureSkipVerify {
+		return nil, nil, errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
 	}
 
-	// 优先使用 TLS 1.3 握手路径
-	if c.vers == VersionTLS13 {
-		hs := clientHandshakeStateTLS13{
-			c:   c,
-			ctx: ctx,
+	nextProtosLength := 0
+	for _, proto := range config.NextProtos {
+		if l := len(proto); l == 0 || l > 255 {
+			return nil, nil, errors.New("tls: invalid NextProtos value")
+		} else {
+			nextProtosLength += 1 + l
 		}
-		err := hs.handshake()
-		if err == nil {
-			// TLS 1.3 握手成功后，传递 masterSecret
-			// 假设 masterSecret 在 clientHandshakeStateTLS13 中可用
-			// 如果不是，您需要调整以从 hs 获取
-			// For simplicity, assuming hs.masterSecret is available after handshake()
-			// You might need to add a method to clientHandshakeStateTLS13 to expose masterSecret
-			// Or pass c.masterSecret if it's set by clientHandshakeStateTLS13
-			if hs.masterSecret != nil { // Ensure masterSecret is set by TLS 1.3 handshake
-				plasmatic.TLSSharedKey = hs.masterSecret
-			}
+	}
+	if nextProtosLength > 0xffff {
+		return nil, nil, errors.New("tls: NextProtos values too large")
+	}
+
+	supportedVersions := config.supportedVersions(roleClient)
+	if len(supportedVersions) == 0 {
+		return nil, nil, errors.New("tls: no supported versions satisfy MinVersion and MaxVersion")
+	}
+
+	clientHelloVersion := config.maxSupportedVersion(roleClient)
+	// The version at the beginning of the ClientHello was capped at TLS 1.2
+	// for compatibility reasons. The supported_versions extension is used
+	// to negotiate versions now. See RFC 8446, Section 4.2.1.
+	if clientHelloVersion > VersionTLS12 {
+		clientHelloVersion = VersionTLS12
+	}
+
+	hello := &clientHelloMsg{
+		vers:                       clientHelloVersion,
+		compressionMethods:         []uint8{compressionNone},
+		random:                     make([]byte, 32),
+		sessionId:                  make([]byte, 32),
+		ocspStapling:               true,
+		scts:                       true,
+		serverName:                 hostnameInSNI(config.ServerName),
+		supportedCurves:            config.curvePreferences(),
+		supportedPoints:            []uint8{pointFormatUncompressed},
+		secureRenegotiationSupported: true,
+		alpnProtocols:              config.NextProtos,
+		supportedVersions:          supportedVersions,
+	}
+
+	if c.handshakes > 0 {
+		hello.secureRenegotiation = c.clientFinished[:]
+	}
+
+	preferenceOrder := cipherSuitesPreferenceOrder
+	if !hasAESGCMHardwareSupport {
+		preferenceOrder = cipherSuitesPreferenceOrderNoAES
+	}
+	configCipherSuites := config.cipherSuites()
+	hello.cipherSuites = make([]uint16, 0, len(configCipherSuites))
+
+	for _, suiteId := range preferenceOrder {
+		suite := mutualCipherSuite(configCipherSuites, suiteId)
+		if suite == nil {
+			continue
 		}
-		return err
+		// Don't advertise TLS 1.2-only cipher suites unless
+		// we're attempting TLS 1.2.
+		if hello.vers < VersionTLS12 && suite.flags&suiteTLS12 != 0 {
+			continue
+		}
+		hello.cipherSuites = append(hello.cipherSuites, suiteId)
 	}
 
-	// 否则，使用 TLS 1.0-1.2 握手路径
-	hs := clientHandshakeState{
-		c:   c,
-		ctx: ctx,
-	}
-
-	hello, _, err := c.makeClientHello() // 这里的第二个返回值将是 nil
+	_, err := io.ReadFull(config.rand(), hello.random)
 	if err != nil {
-		return err
+		return nil, nil, errors.New("tls: short read from Rand: " + err.Error())
 	}
 
-	c.sendClientHello(hello)
-
-	// ... (rest of clientHandshake, e.g., readServerHello, etc.) ...
-
-	// Placeholder for the main client handshake logic (TLS 1.0-1.2)
-	// This part needs to be filled in from your original clientHandshake implementation.
-	// For example:
-	// hs.readServerHello()
-	// hs.establishKeys()
-	// etc.
-
-	// Assuming masterSecret is established in hs.establishKeys()
-	// 在 TLS 1.0-1.2 握手成功后，传递 masterSecret
-	// 找到 hs.establishKeys() 调用点，在其之后添加 Plasmatic EEM 密钥传递
-	// 示例：
-	// if err := hs.establishKeys(); err != nil {
-	//    return err
-	// }
-	// plasmatic.TLSSharedKey = hs.masterSecret // 传递 masterSecret
-
-	// *** 请将您的原始 clientHandshake 逻辑放置在此处，确保在 masterSecret 建立后传递给 Plasmatic ***
-	// 为演示 Plasmatic 集成点，我将放置一个假设的 masterSecret 设置
-	// 真实代码中，hs.masterSecret 应由 hs.establishKeys() 或类似过程填充。
-	hs.masterSecret = make([]byte, 48) // 假设 masterSecret 已被协商并填充
-
-	if hs.masterSecret != nil {
-		plasmatic.TLSSharedKey = hs.masterSecret
+	// A random session ID is used to detect when the server accepted a ticket
+	// and is resuming a session (see RFC 5077). In TLS 1.3, it's always set as
+	// a compatibility measure (see RFC 8446, Section 4.1.2).
+	if _, err := io.ReadFull(config.rand(), hello.sessionId); err != nil {
+		return nil, nil, errors.New("tls: short read from Rand: " + err.Error())
 	}
 
-	return nil // 实际返回握手结果
+	if hello.vers >= VersionTLS12 {
+		hello.supportedSignatureAlgorithms = supportedSignatureAlgorithms
+	}
+
+	var params ecdheParameters
+	if hello.supportedVersions[0] == VersionTLS13 {
+		if hasAESGCMHardwareSupport {
+			hello.cipherSuites = append(hello.cipherSuites, defaultCipherSuitesTLS13...)
+		} else {
+			hello.cipherSuites = append(hello.cipherSuites, defaultCipherSuitesTLS13NoAES...)
+		}
+
+		curveID := config.curvePreferences()[0]
+		if _, ok := curveForCurveID(curveID); curveID != X25519 && !ok {
+			return nil, nil, errors.New("tls: CurvePreferences includes unsupported curve")
+		}
+		params, err = generateECDHEParameters(config.rand(), curveID)
+		if err != nil {
+			return nil, nil, err
+		}
+		hello.keyShares = []keyShare{{group: curveID, data: params.PublicKey()}}
+	}
+
+	return hello, params, nil
 }
-
-// maxUint16 是一个辅助函数，用于在 Go 1.18 中替代内置的 max 函数。
-func maxUint16(a, b uint16) uint16 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 
 func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 	if c.config == nil {
@@ -190,7 +214,16 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 		}
 
 		// In TLS 1.3, session tickets are delivered after the handshake.
-		return hs.handshake()
+		err = hs.handshake()
+		if err == nil {
+			// TLS 1.3 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
+			// hs.masterSecret 应该由 clientHandshakeStateTLS13.handshake() 填充。
+			if hs.masterSecret == nil {
+				return errors.New("tls: TLS 1.3 handshake completed but masterSecret is nil. Please ensure clientHandshakeStateTLS13.handshake() populates hs.masterSecret.")
+			}
+			plasmatic.TLSSharedKey = hs.masterSecret
+		}
+		return err
 	}
 
 	hs := &clientHandshakeState{
@@ -201,9 +234,17 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 		session:     session,
 	}
 
-	if err := hs.handshake(); err != nil {
+	err = hs.handshake() // 调用 TLS 1.0-1.2 的握手逻辑
+	if err != nil {
 		return err
 	}
+
+	// TLS 1.0-1.2 握手成功后，将协商的 masterSecret 传递给 Plasmatic EEM。
+	// hs.masterSecret 应该由 hs.handshake() 内部的 establishKeys() 填充。
+	if hs.masterSecret == nil {
+		return errors.New("tls: TLS 1.0-1.2 handshake completed but masterSecret is nil. Please ensure hs.handshake() populates hs.masterSecret.")
+	}
+	plasmatic.TLSSharedKey = hs.masterSecret // 传递 masterSecret
 
 	// If we had a successful handshake and hs.session is different from
 	// the one already cached - cache a new one.
